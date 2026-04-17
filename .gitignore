@@ -1,0 +1,14 @@
+# Runtime logs
+logs/*.log
+
+# Configuration with credentials (only .example is tracked)
+config/epf_purge.conf
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Editor files
+*.swp
+*.swo
+*~

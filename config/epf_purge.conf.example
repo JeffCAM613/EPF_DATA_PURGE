@@ -1,0 +1,29 @@
+# ============================================================================
+# EPF Data Purge - Configuration File
+# ============================================================================
+# Copy this file to epf_purge.conf and edit the values.
+# Used for automated/scheduled runs (non-interactive mode).
+#
+# Usage:
+#   Linux:   ./bin/epf_purge.sh --config config/epf_purge.conf
+#   Windows: bin\epf_purge.bat --config config\epf_purge.conf
+# ============================================================================
+
+# Oracle connection
+TNS_NAME=EPFPROD
+USERNAME=oppayments
+
+# Password: For security, set via environment variable EPF_PURGE_PASSWORD
+# instead of storing it here. If EPF_PURGE_PASSWORD is set, it takes
+# precedence over this value.
+# PASSWORD=
+
+# Purge parameters
+RETENTION_DAYS=30
+PURGE_DEPTH=ALL
+BATCH_SIZE=1000
+
+# Execution options
+DRY_RUN=N
+RECLAIM_SPACE=N
+DROP_PACKAGE_AFTER=N
