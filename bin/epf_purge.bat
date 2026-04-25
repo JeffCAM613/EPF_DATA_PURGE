@@ -178,7 +178,7 @@ if /i "%INTERACTIVE%"=="Y" (
     if not "!RETENTION_INPUT!"=="" set "RETENTION_DAYS=!RETENTION_INPUT!"
 
     REM Auto-capture module sizes for depth prompt + max-iter recommendation.
-    REM Silent on failure -- depth prompt falls back to no GB hints.
+    REM Capture module sizes for depth prompt + max-iter recommendation.
     echo.
     echo [INFO]  Querying current data sizes...
     call :capture_module_sizes
@@ -187,6 +187,7 @@ if /i "%INTERACTIVE%"=="Y" (
         call :log "[OK]    Sizes: PAYMENTS=!EPF_PAY_GB!GB  LOGS=!EPF_LOG_GB!GB  BANK_STATEMENTS=!EPF_BST_GB!GB  TOTAL=!EPF_TOTAL_GB!GB  TS-Datafile=!EPF_DATAFILE_GB!GB"
     ) else (
         echo [WARN]  Could not query data sizes -- depth prompt will not show GB hints.
+        if defined EPF_SIZE_ERR echo [WARN]    Reason: !EPF_SIZE_ERR!
     )
 
     echo.
@@ -454,11 +455,11 @@ REM ============================================================================
 REM The space comparison needs dba_segments to match reclaim report numbers.
 REM Grants are idempotent and only run when SYS password is available.
 if not "!SYS_PASSWORD!"=="" (
-    call :log "[INFO]  Granting DBA view access to %USERNAME% for space snapshots..."
+    call :log "[INFO]  Granting DBA view access to !USERNAME! for space snapshots..."
     (
         echo SET HEADING OFF FEEDBACK OFF
-        echo GRANT SELECT ON sys.dba_segments TO %USERNAME%;
-        echo GRANT SELECT ON sys.dba_lobs TO %USERNAME%;
+        echo GRANT SELECT ON sys.dba_segments TO !USERNAME!;
+        echo GRANT SELECT ON sys.dba_lobs TO !USERNAME!;
         echo EXIT;
     ) | sqlplus -S "sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA" >> "%LOG_FILE%" 2>&1
     call :log "[OK]    DBA view grants applied"
@@ -473,7 +474,7 @@ if /i "%TRUNCATE_LOGS%"=="Y" (
         echo TRUNCATE TABLE oppayments.epf_purge_log;
         echo TRUNCATE TABLE oppayments.epf_purge_space_snapshot;
         echo EXIT;
-    ) | sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" >nul 2>&1
+    ) | sqlplus -S "!USERNAME!/!PASSWORD!@!TNS_NAME!" >nul 2>&1
     call :log "[OK]    Purge logs truncated"
 )
 
@@ -501,7 +502,7 @@ if /i "%OPTIMIZE_DB%"=="Y" (
         (
             echo SET SERVEROUTPUT ON SIZE UNLIMITED
             echo @"%SQL_DIR%\06b_create_purge_indexes.sql"
-        ) | sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" >> "%LOG_FILE%" 2>&1
+        ) | sqlplus -S "!USERNAME!/!PASSWORD!@!TNS_NAME!" >> "%LOG_FILE%" 2>&1
         call :log "[OK]    Temporary FK indexes created"
     )
 )
@@ -631,7 +632,7 @@ if not "!SYS_PASSWORD!"=="" (
             echo EXIT;
         ) > "%TEMP%\epf_undo_restore.sql"
         sqlplus -S "sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA" @"%TEMP%\epf_undo_restore.sql" > "%TEMP%\epf_undo_restore.out" 2>&1
-        powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { Get-Content '%TEMP%\epf_undo_restore.out' | ForEach-Object { $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
+        powershell -Command "& { $fs=[IO.FileStream]::new('!LOG_FILE!','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { Get-Content '!TEMP!\epf_undo_restore.out' | ForEach-Object { $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
         findstr /C:"undo_retention=900" "%TEMP%\epf_undo_restore.out" >nul 2>&1
         if !ERRORLEVEL! EQU 0 (
             echo [OK]    undo_retention restored to 900s
@@ -657,7 +658,7 @@ if /i "%OPTIMIZE_DB%"=="Y" (
             echo @"%SQL_DIR%\06c_drop_purge_indexes.sql"
             echo EXIT;
         ) > "%TEMP%\epf_drop_idx.sql"
-        powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S '%USERNAME%/%PASSWORD%@%TNS_NAME%' '@%TEMP%\epf_drop_idx.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
+        powershell -Command "& { $fs=[IO.FileStream]::new('!LOG_FILE!','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S '!USERNAME!/!PASSWORD!@!TNS_NAME!' '@%TEMP%\epf_drop_idx.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
         del "%TEMP%\epf_drop_idx.sql" >nul 2>&1
         call :log "[OK]    Temporary FK indexes dropped"
     )
@@ -691,7 +692,7 @@ if /i "%RECLAIM_SPACE%"=="Y" (
         REM Positional args: target_pct_free, max_iterations, skip_stall_checks
         > "%TEMP%\epf_reclaim_online.sql" echo @"%SQL_DIR%\05_reclaim_tablespace.sql" 10 !MAX_ITERATIONS! !SKIP_STALL_CHECKS!
         >> "%TEMP%\epf_reclaim_online.sql" echo EXIT;
-        powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S 'sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA' '@%TEMP%\epf_reclaim_online.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
+        powershell -Command "& { $fs=[IO.FileStream]::new('!LOG_FILE!','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S 'sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA' '@%TEMP%\epf_reclaim_online.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
         del "%TEMP%\epf_reclaim_online.sql" >nul 2>&1
         powershell -Command "Start-Sleep -Seconds 15"
         call :log "[OK]    Online reclaim completed"
@@ -708,9 +709,9 @@ if /i not "%DRY_RUN%"=="Y" (
     REM ----- Pre-comparison reclaim status check (post-fail warning) -----
     if /i "%RECLAIM_SPACE%"=="Y" (
         > "%TEMP%\epf_reclaim_probe.sql" echo SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 4000 TRIMSPOOL ON
-        >> "%TEMP%\epf_reclaim_probe.sql" echo SELECT NVL(status, 'MISSING') ^|^| '^|' ^|^| NVL(REPLACE(message, CHR(10), ' '), '') FROM ^( SELECT status, message FROM oppayments.epf_purge_log WHERE operation = 'RECLAIM_END' ORDER BY log_timestamp DESC ^) WHERE ROWNUM = 1;
+        >> "%TEMP%\epf_reclaim_probe.sql" echo SELECT NVL^(status, 'MISSING'^) ^|^| '^|' ^|^| NVL^(REPLACE^(message, CHR^(10^), ' '^), ''^) FROM ^( SELECT status, message FROM oppayments.epf_purge_log WHERE operation = 'RECLAIM_END' ORDER BY log_timestamp DESC ^) WHERE ROWNUM = 1;
         >> "%TEMP%\epf_reclaim_probe.sql" echo EXIT;
-        sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" @"%TEMP%\epf_reclaim_probe.sql" > "%TEMP%\epf_reclaim_probe.out" 2>nul
+        sqlplus -S "!USERNAME!/!PASSWORD!@!TNS_NAME!" @"%TEMP%\epf_reclaim_probe.sql" > "%TEMP%\epf_reclaim_probe.out" 2>nul
         del "%TEMP%\epf_reclaim_probe.sql" >nul 2>&1
         set "RECLAIM_END_LINE="
         for /f "usebackq delims=" %%L in ("%TEMP%\epf_reclaim_probe.out") do (
@@ -745,7 +746,7 @@ if /i not "%DRY_RUN%"=="Y" (
     REM modules the user actually purged.
     > "%TEMP%\epf_space_compare.sql" echo DEFINE depth = %PURGE_DEPTH%
     >> "%TEMP%\epf_space_compare.sql" echo @"%SQL_DIR%\09_space_compare.sql"
-    powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S '%USERNAME%/%PASSWORD%@%TNS_NAME%' '@%TEMP%\epf_space_compare.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
+    powershell -Command "& { $fs=[IO.FileStream]::new('!LOG_FILE!','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S '!USERNAME!/!PASSWORD!@!TNS_NAME!' '@%TEMP%\epf_space_compare.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
     del "%TEMP%\epf_space_compare.sql" >nul 2>&1
 
     REM ----- Post-reclaim "max-iter exhausted" recommendation banner -----
@@ -753,7 +754,7 @@ if /i not "%DRY_RUN%"=="Y" (
         > "%TEMP%\epf_squeeze_probe.sql" echo SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 4000 TRIMSPOOL ON
         >> "%TEMP%\epf_squeeze_probe.sql" echo SELECT message FROM ^( SELECT message FROM oppayments.epf_purge_log WHERE operation = 'SQUEEZE_PROGRESS' AND status = 'WARNING' AND ^(message LIKE 'Squeeze stopped: max iterations^%%' OR message LIKE 'Squeeze stopped: ^%% consecutive zero-progress^%%'^) ORDER BY log_timestamp DESC ^) WHERE ROWNUM = 1;
         >> "%TEMP%\epf_squeeze_probe.sql" echo EXIT;
-        sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" @"%TEMP%\epf_squeeze_probe.sql" > "%TEMP%\epf_squeeze_probe.out" 2>nul
+        sqlplus -S "!USERNAME!/!PASSWORD!@!TNS_NAME!" @"%TEMP%\epf_squeeze_probe.sql" > "%TEMP%\epf_squeeze_probe.out" 2>nul
         del "%TEMP%\epf_squeeze_probe.sql" >nul 2>&1
         set "SQUEEZE_HIT="
         for /f "usebackq delims=" %%L in ("%TEMP%\epf_squeeze_probe.out") do (
@@ -804,7 +805,7 @@ if /i "%DROP_PACKAGE_AFTER%"=="Y" (
     (
         echo @"%SQL_DIR%\04_drop_epf_purge_pkg.sql"
         echo EXIT;
-    ) | sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" >> "%LOG_FILE%" 2>&1
+    ) | sqlplus -S "!USERNAME!/!PASSWORD!@!TNS_NAME!" >> "%LOG_FILE%" 2>&1
     call :log "[OK]    Package dropped"
 )
 
@@ -817,7 +818,7 @@ if /i "%DROP_LOGS%"=="Y" (
     echo DROP TABLE oppayments.epf_purge_space_snapshot PURGE;> "%TEMP%\epf_droplogs.sql"
     echo DROP TABLE oppayments.epf_purge_log PURGE;>> "%TEMP%\epf_droplogs.sql"
     echo EXIT;>> "%TEMP%\epf_droplogs.sql"
-    sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" @"%TEMP%\epf_droplogs.sql" >> "%LOG_FILE%" 2>&1
+    sqlplus -S "!USERNAME!/!PASSWORD!@!TNS_NAME!" @"%TEMP%\epf_droplogs.sql" >> "%LOG_FILE%" 2>&1
     del "%TEMP%\epf_droplogs.sql" >nul 2>&1
     call :log "[OK]    Purge log tables dropped"
 )
@@ -845,7 +846,7 @@ REM Capture module sizes (DB connectivity required)
 REM ============================================================================
 REM Populates EPF_PAY_GB / EPF_LOG_GB / EPF_BST_GB / EPF_TOTAL_GB / EPF_DATAFILE_GB
 REM by parsing the EPF_SIZES| line emitted by sql/12_capture_module_sizes.sql.
-REM Silent on failure; callers should check whether EPF_TOTAL_GB ended up set.
+REM On failure, sets EPF_SIZE_ERR with a diagnostic hint (if available).
 :capture_module_sizes
 if "%TNS_NAME%"=="" exit /b 1
 if "%PASSWORD%"=="" exit /b 1
@@ -854,13 +855,25 @@ set "EPF_LOG_GB="
 set "EPF_BST_GB="
 set "EPF_TOTAL_GB="
 set "EPF_DATAFILE_GB="
-sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" @"%SQL_DIR%\12_capture_module_sizes.sql" 2>nul > "%TEMP%\epf_sizes.out"
+set "EPF_SIZE_ERR="
+sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" @"%SQL_DIR%\12_capture_module_sizes.sql" > "%TEMP%\epf_sizes.out" 2>&1
 for /f "tokens=1-6 delims=|" %%A in ('findstr /B "EPF_SIZES" "%TEMP%\epf_sizes.out" 2^>nul') do (
     set "EPF_PAY_GB=%%B"
     set "EPF_LOG_GB=%%C"
     set "EPF_BST_GB=%%D"
     set "EPF_TOTAL_GB=%%E"
     set "EPF_DATAFILE_GB=%%F"
+)
+if not defined EPF_TOTAL_GB (
+    REM Capture diagnostic hint: EPF_ERROR line from SQL, or first ORA-/SP2- line
+    for /f "tokens=1,* delims=|" %%A in ('findstr /B "EPF_ERROR" "%TEMP%\epf_sizes.out" 2^>nul') do (
+        set "EPF_SIZE_ERR=%%B"
+    )
+    if not defined EPF_SIZE_ERR (
+        for /f "delims=" %%L in ('findstr /I /R "ORA- SP2- ERROR" "%TEMP%\epf_sizes.out" 2^>nul') do (
+            if not defined EPF_SIZE_ERR set "EPF_SIZE_ERR=%%L"
+        )
+    )
 )
 del "%TEMP%\epf_sizes.out" >nul 2>&1
 if not defined EPF_TOTAL_GB exit /b 1

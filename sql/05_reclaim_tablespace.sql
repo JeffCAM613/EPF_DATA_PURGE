@@ -272,6 +272,10 @@ BEGIN
           AND temporary = 'N'
           AND secondary = 'N'
           AND iot_type IS NULL
+          -- Exclude the purge log tables: the live monitor polls them
+          -- concurrently and SHRINK SPACE takes row-level locks that
+          -- block the monitor's SELECT, causing it to appear "stuck".
+          AND table_name NOT IN ('EPF_PURGE_LOG', 'EPF_PURGE_SPACE_SNAPSHOT')
         ORDER BY owner, table_name
     ) LOOP
         BEGIN

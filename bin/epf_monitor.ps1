@@ -69,16 +69,34 @@ $foundRun = $false
 $done = $false
 $idleSince = Get-Date
 $waitMsgCount = 0
+$monitorStartTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
 
 while (-not $done) {
     # Build a SQL query that fetches new log entries
     if (-not $foundRun) {
-        # Try to find the latest run_id
+        # Find the latest run_id that is either:
+        #   (a) still in progress (no RECLAIM_END and no top-level ERROR), OR
+        #   (b) started after this monitor was launched
+        # This prevents the monitor from picking up a completed old run,
+        # replaying its RECLAIM_END / ERROR termination event, and exiting
+        # before the new run even starts.
         $sql = @"
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300 TRIMOUT ON TRIMSPOOL ON
 SELECT RAWTOHEX(run_id) FROM (
     SELECT run_id FROM oppayments.epf_purge_log
     WHERE operation = 'RUN_START'
+      AND (
+          -- Run started after the monitor launched (definitely current)
+          log_timestamp >= TO_TIMESTAMP('$monitorStartTime', 'YYYY-MM-DD HH24:MI:SS')
+          OR
+          -- Run has not completed yet (still in progress)
+          NOT EXISTS (
+              SELECT 1 FROM oppayments.epf_purge_log e2
+              WHERE e2.run_id = oppayments.epf_purge_log.run_id
+                AND (e2.operation = 'RECLAIM_END'
+                     OR (e2.module = 'ORCHESTRATOR' AND e2.status = 'ERROR'))
+          )
+      )
     ORDER BY log_timestamp DESC
 ) WHERE ROWNUM = 1;
 EXIT;

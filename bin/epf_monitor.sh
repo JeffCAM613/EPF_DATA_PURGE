@@ -58,17 +58,32 @@ done_flag=0
 idle_since=$(date +%s)
 wait_msg_count=0
 max_idle_sec=$((MAX_WAIT_MIN * 60))
+monitor_start_utc=$(date -u '+%Y-%m-%d %H:%M:%S')
 
 while [[ $done_flag -eq 0 ]]; do
     # ------------------------------------------------------------------------
     # Discover latest run_id
     # ------------------------------------------------------------------------
+    # Only pick up runs that are either still in progress or started after
+    # this monitor was launched.  Prevents the monitor from locking onto a
+    # completed old run, replaying its RECLAIM_END / ERROR, and exiting
+    # before the current run even begins.
     if [[ $found_run -eq 0 ]]; then
-        run_id=$(sqlplus -S "$CONN_STR" <<'ENDSQL' 2>/dev/null | tr -d '[:space:]'
+        run_id=$(sqlplus -S "$CONN_STR" <<ENDSQL 2>/dev/null | tr -d '[:space:]'
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300 TRIMOUT ON TRIMSPOOL ON
 SELECT RAWTOHEX(run_id) FROM (
     SELECT run_id FROM oppayments.epf_purge_log
     WHERE operation = 'RUN_START'
+      AND (
+          log_timestamp >= TO_TIMESTAMP('${monitor_start_utc}', 'YYYY-MM-DD HH24:MI:SS')
+          OR
+          NOT EXISTS (
+              SELECT 1 FROM oppayments.epf_purge_log e2
+              WHERE e2.run_id = oppayments.epf_purge_log.run_id
+                AND (e2.operation = 'RECLAIM_END'
+                     OR (e2.module = 'ORCHESTRATOR' AND e2.status = 'ERROR'))
+          )
+      )
     ORDER BY log_timestamp DESC
 ) WHERE ROWNUM = 1;
 EXIT;

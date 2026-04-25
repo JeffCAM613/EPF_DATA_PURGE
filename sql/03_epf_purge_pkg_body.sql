@@ -1597,17 +1597,19 @@ AS
               AND UPPER(parent_table) = 'SPEC_TRT_LOG';
 
             IF v_spec_trt_count = 0 THEN
-                INSERT INTO oppayments.epf_purge_space_snapshot
-                    (run_id, snapshot_phase, owner, segment_name, segment_type,
-                     parent_table, size_bytes, size_mb, module)
-                SELECT p_run_id, p_snapshot_phase, owner, segment_name, segment_type,
-                       'SPEC_TRT_LOG' AS parent_table,
-                       SUM(bytes) AS size_bytes,
-                       ROUND(SUM(bytes) / 1048576, 2) AS size_mb,
-                       'LOGS' AS module
-                FROM dba_segments
-                WHERE owner = 'OP' AND segment_name = 'SPEC_TRT_LOG'
-                GROUP BY owner, segment_name, segment_type;
+                EXECUTE IMMEDIATE
+                    'INSERT INTO oppayments.epf_purge_space_snapshot
+                        (run_id, snapshot_phase, owner, segment_name, segment_type,
+                         parent_table, size_bytes, size_mb, module)
+                    SELECT :run_id, :phase, owner, segment_name, segment_type,
+                           ''SPEC_TRT_LOG'' AS parent_table,
+                           SUM(bytes) AS size_bytes,
+                           ROUND(SUM(bytes) / 1048576, 2) AS size_mb,
+                           ''LOGS'' AS module
+                    FROM dba_segments
+                    WHERE owner = ''OP'' AND segment_name = ''SPEC_TRT_LOG''
+                    GROUP BY owner, segment_name, segment_type'
+                    USING p_run_id, p_snapshot_phase;
             END IF;
         EXCEPTION
             WHEN OTHERS THEN

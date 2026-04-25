@@ -215,15 +215,27 @@ HELPEOF
 # Capture module sizes (DB connectivity required)
 # ============================================================================
 # Populates EPF_PAY_GB / EPF_LOG_GB / EPF_BST_GB / EPF_TOTAL_GB / EPF_DATAFILE_GB
-# from sql/12_capture_module_sizes.sql. Silent on failure -- callers should
-# check whether EPF_TOTAL_GB ended up set before formatting size hints.
+# from sql/12_capture_module_sizes.sql. On failure, sets EPF_SIZE_ERR with a
+# diagnostic hint (if available) and returns 1.
 capture_module_sizes() {
     [[ -z "$TNS_NAME" || -z "$PASSWORD" ]] && return 1
-    local out
-    out=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" \
-              @"${SQL_DIR}/12_capture_module_sizes.sql" 2>/dev/null \
-              | grep '^EPF_SIZES|' | head -1)
-    [[ -z "$out" ]] && return 1
+    EPF_SIZE_ERR=""
+    local raw_out out
+    raw_out=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" \
+              @"${SQL_DIR}/12_capture_module_sizes.sql" 2>&1)
+    out=$(echo "$raw_out" | grep '^EPF_SIZES|' | head -1)
+    if [[ -z "$out" ]]; then
+        # Check for diagnostic line from the SQL's outer exception handler
+        local err_line
+        err_line=$(echo "$raw_out" | grep '^EPF_ERROR|' | head -1)
+        if [[ -n "$err_line" ]]; then
+            EPF_SIZE_ERR="${err_line#EPF_ERROR|}"
+        else
+            # Fall back to first ORA-/SP2-/ERROR line from sqlplus itself
+            EPF_SIZE_ERR=$(echo "$raw_out" | grep -i 'ORA-\|SP2-\|ERROR' | head -1)
+        fi
+        return 1
+    fi
     IFS='|' read -r _ EPF_PAY_GB EPF_LOG_GB EPF_BST_GB EPF_TOTAL_GB EPF_DATAFILE_GB <<< "$out"
     return 0
 }
@@ -282,6 +294,7 @@ interactive_prompts() {
         log_ok "Sizes: PAYMENTS=${EPF_PAY_GB}GB  LOGS=${EPF_LOG_GB}GB  BANK_STATEMENTS=${EPF_BST_GB}GB  TOTAL=${EPF_TOTAL_GB}GB  TS-Datafile=${EPF_DATAFILE_GB}GB"
     else
         log_warn "Could not query data sizes -- depth prompt will not show GB hints."
+        [[ -n "$EPF_SIZE_ERR" ]] && log_warn "  Reason: $EPF_SIZE_ERR"
         compute_recommended_max_iter
     fi
 
