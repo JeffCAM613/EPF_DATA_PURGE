@@ -463,39 +463,65 @@ if not "!SYS_PASSWORD!"=="" (
 )
 
 REM ============================================================================
-REM Start background progress monitor
+REM Start live progress monitor in a SEPARATE console window
 REM ============================================================================
-REM Launches a PowerShell script that polls epf_purge_log via separate SQL*Plus
-REM calls every 10s. Each poll is a fresh invocation so output is NEVER buffered.
-REM The purge runs with or without the monitor - it is purely informational.
+REM Earlier attempts to share this console with the monitor (Start-Process
+REM -NoNewWindow) had handle-inheritance buffering issues that hid live output
+REM until Ctrl+C. A separate console window owns its own console handle, so
+REM output is flushed normally.
+REM
+REM Layout:
+REM   - This window  : summary lines only ([INFO]/[OK]/[WARN] from the wrapper)
+REM   - Monitor window: live updates polled from epf_purge_log every 10s
+REM   - Log file     : both summary and live updates appended together
 set "MONITOR_PID="
 set "MONITOR_SCRIPT=%SCRIPT_DIR%epf_monitor.ps1"
 
 if not exist "!MONITOR_SCRIPT!" (
     echo [WARN]  Monitor script not found: !MONITOR_SCRIPT!
-    echo [WARN]  Purge will continue without live progress.
-    echo [WARN]  You can check progress manually: SELECT message FROM oppayments.epf_purge_log ORDER BY log_id DESC;
+    echo [WARN]  Purge will continue without live monitor. Tail %LOG_FILE% for log.
     goto :skip_monitor_start
 )
 
-echo [INFO]  Starting live progress monitor ^(polls epf_purge_log every 10s^)
-powershell -Command "& { try { $p = Start-Process -FilePath 'powershell' -ArgumentList '-ExecutionPolicy','Bypass','-File','!MONITOR_SCRIPT!','-ConnStr','%USERNAME%/%PASSWORD%@%TNS_NAME%','-PollSec','10','-MaxWaitMin','360','-LogFile','%LOG_FILE%' -PassThru -NoNewWindow -ErrorAction Stop; $p.Id | Out-File -FilePath '%TEMP%\epf_monitor_pid.txt' -Encoding ascii } catch { $_.Exception.Message | Out-File -FilePath '%TEMP%\epf_monitor_err.txt' -Encoding ascii } }" 2>nul
+REM Write a tiny launcher .bat that the new console window will run. Using a
+REM file instead of inline arguments avoids the cmd^>powershell^>cmd quote-
+REM escaping mess. The trailing pause keeps the window open after the monitor
+REM exits so the operator can read the final RECLAIM_END / RUN_END lines.
+> "%TEMP%\epf_monitor_launcher.bat" (
+    echo @echo off
+    echo title EPF Live Monitor
+    echo echo Live progress monitor for EPF purge run.
+    echo echo Connection: %USERNAME%/******@%TNS_NAME%
+    echo echo Log file:   %LOG_FILE%
+    echo echo.
+    echo powershell -ExecutionPolicy Bypass -File "%MONITOR_SCRIPT%" -ConnStr "%USERNAME%/%PASSWORD%@%TNS_NAME%" -PollSec 10 -MaxWaitMin 360 -LogFile "%LOG_FILE%"
+    echo echo.
+    echo echo [Monitor exited. Press any key to close this window.]
+    echo pause ^>nul
+)
+
+REM Spawn the launcher in a NEW console window. PowerShell's Start-Process
+REM (without -NoNewWindow) creates a new console; -PassThru gives us the PID.
+echo [INFO]  Opening live progress monitor in a separate console window...
+echo [INFO]  This window will keep showing summary lines only.
+echo [INFO]  All output (summary + live updates) is written to: %LOG_FILE%
+
+powershell -Command "& { try { $p = Start-Process cmd -ArgumentList '/c','%TEMP%\epf_monitor_launcher.bat' -PassThru -ErrorAction Stop; $p.Id | Out-File -FilePath '%TEMP%\epf_monitor_pid.txt' -Encoding ascii } catch { $_.Exception.Message | Out-File -FilePath '%TEMP%\epf_monitor_err.txt' -Encoding ascii } }" 2>nul
 
 if exist "%TEMP%\epf_monitor_err.txt" (
     set /p MONITOR_ERR=<"%TEMP%\epf_monitor_err.txt"
-    echo [WARN]  Failed to start monitor: !MONITOR_ERR!
-    echo [WARN]  Purge will continue without live progress.
-    echo [WARN]  You can check progress manually: SELECT message FROM oppayments.epf_purge_log ORDER BY log_id DESC;
+    echo [WARN]  Failed to open monitor window: !MONITOR_ERR!
+    echo [WARN]  Purge will continue without live monitor. Tail %LOG_FILE% for log.
     del "%TEMP%\epf_monitor_err.txt" >nul 2>&1
     goto :skip_monitor_start
 )
 
 if exist "%TEMP%\epf_monitor_pid.txt" (
     set /p MONITOR_PID=<"%TEMP%\epf_monitor_pid.txt"
-    echo [OK]    Monitor started ^(PID: !MONITOR_PID!^)
+    echo [OK]    Live monitor opened in separate window (cmd PID: !MONITOR_PID!).
 ) else (
-    echo [WARN]  Monitor may not have started ^(no PID captured^).
-    echo [WARN]  Purge will continue without live progress.
+    echo [WARN]  Monitor may not have started (no PID captured).
+    echo [WARN]  Purge will continue without live monitor. Tail %LOG_FILE% for log.
 )
 del "%TEMP%\epf_monitor_pid.txt" >nul 2>&1
 
@@ -618,9 +644,15 @@ if /i not "%DRY_RUN%"=="Y" (
 REM ============================================================================
 REM Stop monitor (safe to run even if monitor never started)
 REM ============================================================================
-if "!MONITOR_PID!"=="" goto :monitor_stopped
-powershell -Command "& { try { $proc = Get-Process -Id !MONITOR_PID! -ErrorAction Stop; echo '[INFO]  Waiting for monitor to detect completion...'; if (-not $proc.WaitForExit(60000)) { echo '[WARN]  Monitor did not exit in time, terminating.'; $proc.Kill() } } catch { <# process already exited - normal #> } }" 2>nul
-set "MONITOR_PID="
+REM We do NOT auto-kill the separate console window. The launcher .bat ends in
+REM `pause`, so the window stays open after the monitor exits naturally and the
+REM operator can read the final RECLAIM_END / RUN_END lines. Closing the window
+REM is a manual action. If the wrapper finishes before the monitor exits (rare),
+REM the operator simply sees the still-running monitor and can close it.
+del "%TEMP%\epf_monitor_launcher.bat" >nul 2>&1
+if not "!MONITOR_PID!"=="" (
+    echo [INFO]  Live monitor window left open for review. Close it manually when done.
+)
 :monitor_stopped
 
 REM ============================================================================

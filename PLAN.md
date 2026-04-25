@@ -32,6 +32,14 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) Phase 1 loop — emit `SHRINK_PROGRESS` every 10 tables OR 60s; removed buffered per-table `SHRINK OK` print
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — top-level `EXCEPTION WHEN OTHERS` emits `RECLAIM_END status=ERROR` then re-raises
 
+**Phase 1 follow-up round 3 (after third user test):**
+- Round 2's raw `StreamWriter` made things worse — monitor showed nothing at all. Root cause: spawning the monitor via `Start-Process -PassThru -NoNewWindow` from one PowerShell into another corrupts handle inheritance such that `[Console]::OpenStandardOutput()` doesn't connect to the visible console. Decision: stop trying to share the parent's console. Move the monitor to a **separate console window**.
+- [bin/epf_purge.bat](bin/epf_purge.bat) `start_monitor` — writes a small launcher .bat to `%TEMP%`, then spawns it via `Start-Process cmd` (no `-NoNewWindow`) which opens a new console window. The launcher runs the monitor and ends with `pause` so the window stays open after the monitor exits, letting the operator read the final output. Captures the cmd PID for cleanup.
+- [bin/epf_purge.bat](bin/epf_purge.bat) `stop_monitor` — does **not** force-kill the monitor window. The launcher's `pause` keeps it open until the operator closes it manually. Cleanup deletes the temp launcher.bat.
+- [bin/epf_purge.sh](bin/epf_purge.sh) `start_monitor` — backgrounds the monitor with stdout/stderr redirected to `/dev/null` so live updates don't interleave with main wrapper output. Monitor still appends every line to `$LOG_FILE`. Wrapper prints a `tail -f "$LOG_FILE"` instruction so the operator can watch live in another terminal.
+- [bin/epf_monitor.ps1](bin/epf_monitor.ps1) — reverted `Write-Log` to plain `Write-Host`. The raw `StreamWriter` was only needed to fight the inherited-handle buffering, which the new architecture sidesteps. Removed the `$script:rawStdout` cleanup.
+- Layout invariant (both platforms): main console = summary lines only; live updates appear in a separate window (Windows) or via `tail -f LOG_FILE` (Linux); LOG_FILE contains both, in chronological append order.
+
 **Phase 1 follow-up round 2 (after second user test):**
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — SHRINK_PROGRESS reverted to **every 10 tables, no wallclock floor**. The 60s floor turned into "log every iter" because individual SHRINK ops can exceed 60s, so the throttle fired every loop body. Per-N-tables cadence is the only useful knob.
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — SQUEEZE_PROGRESS reverted to **every 25 iters, no wallclock floor** (user's explicit preference). Max log volume now ~80 lines for a 2000-iter cap.
@@ -96,17 +104,29 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 - 1F-2.A — Cadence too verbose: "every 10/25 iters OR 60s wallclock" became "every iter" when iters took 90-300s each (LOB MOVE on retained data). User wanted original 25-iter behavior with no floor. → **Fixed** in round 2.
 - 1F-2.B — `Console.Out.Flush()` did NOT fully resolve the buffering issue: user still saw `~8min stuck` gaps that only flushed on Ctrl+C. → **Fixed** in round 2 by switching to raw `StreamWriter` over `OpenStandardOutput()`.
 
-**Re-test items after follow-up round 2 fixes (please run again):**
+**Re-test items after follow-up round 2 fixes:**
 
 | # | Check | Observation |
 |---|-------|-------------|
-| 1G.1 | SQUEEZE_PROGRESS now fires every 25 iters with **no per-iter logging**, regardless of iter speed. For a 2000-iter cap, expect ~80 SQUEEZE_PROGRESS lines maximum. | _to fill_ |
-| 1G.2 | SHRINK_PROGRESS fires every 10 tables with no wallclock chatter. | _to fill_ |
-| 1G.3 | When squeeze exits because target was reached, you see a `SQUEEZE_PROGRESS — Squeeze done at iter N: HWM=...` line before reclaim moves to Phase 3 (resize). | _to fill_ |
-| 1G.4 | When squeeze exits because max iter was hit, you see `SQUEEZE_PROGRESS WARNING — Squeeze stopped: max iterations (N) reached. ...Re-run reclaim with a larger --max-iterations to continue.` | _to fill_ |
-| 1G.5 | When squeeze exits via stall, you see `SQUEEZE_PROGRESS WARNING — Squeeze stopped: 3 consecutive zero-progress checkpoints...` | _to fill_ |
-| 1G.6 | **Live output no longer "sticks"** — lines from epf_purge_log appear on screen within ~10s of being written, no Ctrl+C needed. | _to fill_ |
-| 1G.7 | `** RECLAIM COMPLETED **` (or `*** RECLAIM FAILED ***`) appears live at the end. | _to fill_ |
+| 1G.1 — 1G.7 | (Round 2 cadence/termination/buffering checks) | **Superseded by round 3** — the buffering issue made all of these untestable in round 2 because the monitor displayed nothing. Re-test under the round-3 layout below. |
+
+**Issues found in third user test (drove round 3 fixes):**
+- 1G-3.A — Raw `StreamWriter` over `OpenStandardOutput()` made the situation worse: monitor appeared to start (PID captured) but displayed nothing on stdout. Root cause: `Start-Process -NoNewWindow` from outer-PowerShell-to-inner-PowerShell corrupts which console handle the inner process can write to. → **Fixed** in round 3 by moving monitor to a separate console window (Windows) or a `tail -f`-friendly background log (Linux).
+
+**Re-test items after follow-up round 3 fixes (please run again):**
+
+| # | Check | Observation |
+|---|-------|-------------|
+| 1H.1 | **Windows:** running `bin\epf_purge.bat ...` with `--reclaim` opens a separate console window titled "EPF Live Monitor". | _to fill_ |
+| 1H.2 | **Windows:** the monitor window shows `[MONITOR] Tracking run_id: ...`, then live `RUN_START`, `DELETE batch ...`, `SHRINK_PROGRESS`, `SQUEEZE_PROGRESS`, `RECLAIM_END` lines as they happen — within ~10s of each DB write, no Ctrl+C needed. | _to fill_ |
+| 1H.3 | **Windows:** the main wrapper console shows ONLY summary lines (`[INFO]/[OK]/[WARN]` from the wrapper itself, plus DB connection messages and the configuration summary). No purge batch lines, no SQUEEZE iter lines. | _to fill_ |
+| 1H.4 | **Windows:** after monitor exits naturally (RECLAIM_END), the monitor window shows `[Monitor exited. Press any key to close this window.]` and stays open. Closing it manually completes the run cleanly. | _to fill_ |
+| 1H.5 | **LOG_FILE contents:** `Get-Content` (Windows) or `cat` (Linux) on the log file shows wrapper summary lines and live monitor lines interleaved in chronological order. No content is missing from the log. | _to fill_ |
+| 1H.6 | **Linux:** `bin/epf_purge.sh ...` with `--reclaim` prints `[INFO] Starting live progress monitor in background` and `tail -f "..."` instruction. Main terminal stays clean (summary only). Running `tail -f LOG_FILE` in another terminal shows live updates as they happen. | _to fill_ |
+| 1H.7 | SQUEEZE_PROGRESS fires every 25 iters (no per-iter chatter). Max ~80 lines for 2000-iter cap. | _to fill_ |
+| 1H.8 | SHRINK_PROGRESS fires every 10 tables (no wallclock chatter). | _to fill_ |
+| 1H.9 | Squeeze "target reached" exit shows `Squeeze done at iter N: HWM=... <= target ...`. | _to fill_ |
+| 1H.10 | Max-iter exit (1G.4) and stall exit (1G.5) — same checks as round 2, now testable. | _to fill_ |
 
 ---
 

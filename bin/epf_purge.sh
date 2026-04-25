@@ -464,10 +464,17 @@ SQLEOF
 # ============================================================================
 # Start background progress monitor
 # ============================================================================
-# Launches bin/epf_monitor.sh as a background process. Mirrors the Windows
-# wrapper which launches bin/epf_monitor.ps1. The monitor polls epf_purge_log
-# via SQL*Plus every 10s; each poll is a fresh invocation so output is NEVER
-# buffered (unlike DBMS_OUTPUT which only flushes at block end).
+# Backgrounds bin/epf_monitor.sh with stdout suppressed so live updates don't
+# interleave with the main wrapper console (which is reserved for summary
+# lines). The monitor still appends every line it produces to $LOG_FILE.
+#
+# To watch live progress in another terminal: tail -f "$LOG_FILE"
+#
+# This mirrors the Windows wrapper, which spawns the monitor in a separate
+# console window for the same reason. Layout:
+#   - This terminal : summary lines only ([INFO]/[OK]/[WARN] from wrapper)
+#   - tail -f       : live updates polled from epf_purge_log every 10s
+#   - LOG_FILE      : both summary and live updates appended together
 #
 # The monitor exits on RECLAIM_END, top-level ORCHESTRATOR ERROR, idle
 # timeout, or when stop_monitor terminates it.
@@ -490,13 +497,18 @@ start_monitor() {
     # Ensure executable (script may arrive without +x via git on Windows)
     [[ -x "$MONITOR_SCRIPT" ]] || chmod +x "$MONITOR_SCRIPT" 2>/dev/null || true
 
-    log_info "Starting live progress monitor (polls epf_purge_log every 10s)"
+    log_info "Starting live progress monitor in background (logs to $LOG_FILE)"
+    log_info "This terminal will keep showing summary lines only."
+    log_info "To watch live updates in another terminal:  tail -f \"$LOG_FILE\""
 
+    # stdout/stderr to /dev/null so monitor lines don't interleave with the
+    # wrapper output. The monitor's write_log() also appends each line to
+    # $LOG_FILE directly, so nothing is lost.
     bash "$MONITOR_SCRIPT" \
         "${USERNAME}/${PASSWORD}@${TNS_NAME}" \
         10 \
         360 \
-        "$LOG_FILE" &
+        "$LOG_FILE" >/dev/null 2>&1 &
     MONITOR_PID=$!
     # Give the monitor a moment to connect
     sleep 2
