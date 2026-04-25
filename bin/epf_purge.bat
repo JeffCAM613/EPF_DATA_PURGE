@@ -484,27 +484,29 @@ if not exist "!MONITOR_SCRIPT!" (
 )
 
 REM Write a tiny launcher .bat that the new console window will run. Using a
-REM file instead of inline arguments avoids the cmd^>powershell^>cmd quote-
-REM escaping mess. The trailing pause keeps the window open after the monitor
-REM exits so the operator can read the final RECLAIM_END / RUN_END lines.
-> "%TEMP%\epf_monitor_launcher.bat" (
-    echo @echo off
-    echo title EPF Live Monitor
-    echo echo Live progress monitor for EPF purge run.
-    echo echo Connection: %USERNAME%/******@%TNS_NAME%
-    echo echo Log file:   %LOG_FILE%
-    echo echo.
-    echo powershell -ExecutionPolicy Bypass -File "%MONITOR_SCRIPT%" -ConnStr "%USERNAME%/%PASSWORD%@%TNS_NAME%" -PollSec 10 -MaxWaitMin 360 -LogFile "%LOG_FILE%"
-    echo echo.
-    echo echo [Monitor exited. Press any key to close this window.]
-    echo pause ^>nul
-)
+REM file instead of inline arguments avoids the cmd-^>powershell-^>cmd quote
+REM escaping mess. Each line is appended individually with ^>^> to AVOID a
+REM parenthesised redirection block: cmd's paren parser counts ^( and ^) inside
+REM the block (including inside echo arguments) and any unbalanced or
+REM dot-adjacent paren breaks parsing with ". was unexpected at this time.".
+REM The trailing pause keeps the window open after the monitor exits so the
+REM operator can read the final RECLAIM_END / RUN_END lines.
+> "%TEMP%\epf_monitor_launcher.bat" echo @echo off
+>> "%TEMP%\epf_monitor_launcher.bat" echo title EPF Live Monitor
+>> "%TEMP%\epf_monitor_launcher.bat" echo echo EPF Live progress monitor.
+>> "%TEMP%\epf_monitor_launcher.bat" echo echo Connection: %USERNAME%/******@%TNS_NAME%
+>> "%TEMP%\epf_monitor_launcher.bat" echo echo Log file:   %LOG_FILE%
+>> "%TEMP%\epf_monitor_launcher.bat" echo powershell -ExecutionPolicy Bypass -File "%MONITOR_SCRIPT%" -ConnStr "%USERNAME%/%PASSWORD%@%TNS_NAME%" -PollSec 10 -MaxWaitMin 360 -LogFile "%LOG_FILE%"
+>> "%TEMP%\epf_monitor_launcher.bat" echo echo [Monitor exited. Press any key to close this window.]
+>> "%TEMP%\epf_monitor_launcher.bat" echo pause ^>nul
 
 REM Spawn the launcher in a NEW console window. PowerShell's Start-Process
-REM (without -NoNewWindow) creates a new console; -PassThru gives us the PID.
+REM without -NoNewWindow creates a new console; -PassThru gives us the PID.
+REM Top-level echoes do NOT need parens escaping. The monitor messages here
+REM avoid parens entirely just to keep parsing trivial.
 echo [INFO]  Opening live progress monitor in a separate console window...
 echo [INFO]  This window will keep showing summary lines only.
-echo [INFO]  All output (summary + live updates) is written to: %LOG_FILE%
+echo [INFO]  All output also written to: %LOG_FILE%
 
 powershell -Command "& { try { $p = Start-Process cmd -ArgumentList '/c','%TEMP%\epf_monitor_launcher.bat' -PassThru -ErrorAction Stop; $p.Id | Out-File -FilePath '%TEMP%\epf_monitor_pid.txt' -Encoding ascii } catch { $_.Exception.Message | Out-File -FilePath '%TEMP%\epf_monitor_err.txt' -Encoding ascii } }" 2>nul
 
@@ -516,11 +518,14 @@ if exist "%TEMP%\epf_monitor_err.txt" (
     goto :skip_monitor_start
 )
 
+REM Inside if/else blocks, ALL parens count toward the block's paren depth --
+REM including parens inside echo arguments. We use ^( and ^) to escape so the
+REM parens print literally without disturbing the parser.
 if exist "%TEMP%\epf_monitor_pid.txt" (
     set /p MONITOR_PID=<"%TEMP%\epf_monitor_pid.txt"
-    echo [OK]    Live monitor opened in separate window (cmd PID: !MONITOR_PID!).
+    echo [OK]    Live monitor opened in separate window ^(cmd PID: !MONITOR_PID!^).
 ) else (
-    echo [WARN]  Monitor may not have started (no PID captured).
+    echo [WARN]  Monitor may not have started ^(no PID captured^).
     echo [WARN]  Purge will continue without live monitor. Tail %LOG_FILE% for log.
 )
 del "%TEMP%\epf_monitor_pid.txt" >nul 2>&1
