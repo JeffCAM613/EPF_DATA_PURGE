@@ -19,11 +19,11 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 
 ---
 
-## Phase 1 — Reclaim live logging reliability (Linux/parity)  — **DONE**
+## Phase 1 — Reclaim live logging reliability (Linux/parity)  — **DONE + follow-ups**
 
 **Goal:** make Linux runs stream reclaim progress live, the same way Windows already does, with no silent failure modes.
 
-**Files changed:**
+**Initial round files changed:**
 - new [bin/epf_monitor.sh](bin/epf_monitor.sh) — port of [bin/epf_monitor.ps1](bin/epf_monitor.ps1), positional args `CONN_STR POLL_SEC MAX_WAIT_MIN LOG_FILE`
 - [bin/epf_purge.sh](bin/epf_purge.sh) `start_monitor`/`stop_monitor` — invoke external script instead of inline subshell
 - [bin/epf_purge.sh](bin/epf_purge.sh) `restore_undo_post_purge` — capture sqlplus output, verify `undo_retention=900`, warn on failure
@@ -31,6 +31,15 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 - [bin/epf_monitor.ps1](bin/epf_monitor.ps1) — added `SHRINK_PROGRESS` operation, distinguished `RUN_END`/`RECLAIM_END` ERROR vs SUCCESS
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) Phase 1 loop — emit `SHRINK_PROGRESS` every 10 tables OR 60s; removed buffered per-table `SHRINK OK` print
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — top-level `EXCEPTION WHEN OTHERS` emits `RECLAIM_END status=ERROR` then re-raises
+
+**Phase 1 follow-up round (after first user test):**
+- [bin/epf_purge.bat](bin/epf_purge.bat) undo-restore — replaced cmd `type ... >> %LOG_FILE%` (which collides with the monitor's open write handle and prints `"The process cannot access the file because it is being used by another process."`) with the same PowerShell `FileStream(..., 'ReadWrite')` pattern used elsewhere in the .bat
+- [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — `SET SERVEROUTPUT OFF` to suppress the buffered DBMS_OUTPUT flood that was dumping reclaim headers + per-iter lines after the block ended, garbling the monitor output
+- [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — `SQUEEZE_PROGRESS` cadence improved: log iter 1 + every 10 iters + every 60s wallclock (was every 25 iters with no wallclock floor → 10-min silence on slow MOVEs)
+- [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — explicit Phase 2 start log (`SQUEEZE_PROGRESS — Phase 2 squeeze starting...`) so the monitor draws a clear boundary between SHRINK and SQUEEZE
+- [bin/epf_purge.sh](bin/epf_purge.sh) and [bin/epf_purge.bat](bin/epf_purge.bat) — drain delays (`sleep 15` / `Start-Sleep 15`) before reclaim header and after reclaim ends, so the monitor's 10s polls have time to catch up to RUN_END / RECLAIM_END before the wrapper races ahead
+- [bin/epf_monitor.ps1](bin/epf_monitor.ps1) — `Write-Log` now uses `[Console]::Out.WriteLine` + explicit `Flush()` so output surfaces immediately when stdout is captured by parent cmd.exe (was buffered, only flushed on Ctrl+C)
+- [bin/epf_monitor.ps1](bin/epf_monitor.ps1) — removed unused `$purgeEnded` variable
 
 ### Changes
 
@@ -51,15 +60,31 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 
 ### Test checklist (Phase 1)
 
+**First test round results** (Windows, single end-to-end run on a fresh DB import):
+
 | # | Check | Observation |
 |---|-------|-------------|
-| 1.1 | On Linux, run `--reclaim` end-to-end. Watch live output: see RECLAIM_START, periodic SHRINK_PROGRESS, periodic SQUEEZE_PROGRESS, RECLAIM_END. No silent gap >120s during a long reclaim. | _to fill_ |
-| 1.2 | On Windows, same test. Output should match Linux line-for-line (modulo timestamps). | _to fill_ |
-| 1.3 | Compare the wrapper's stdout vs the contents of `logs/epf_purge_<ts>.log` — they should be identical (same lines, same order). | _to fill_ |
-| 1.4 | Force reclaim to fail (e.g., revoke `ALTER DATABASE` mid-run, or run with a tablespace that doesn't exist). Confirm: monitor shows `RECLAIM_END ERROR` and exits within one poll interval; wrapper exits cleanly; log captures the error. | _to fill_ |
-| 1.5 | Run a 2-minute purge with `--reclaim`. Confirm `undo_retention` is back to 900 after. (`SELECT value FROM v$parameter WHERE name = 'undo_retention';`) | _to fill_ |
-| 1.6 | Kill the wrapper mid-purge with Ctrl+C. Confirm: monitor process dies (no orphans). | _to fill_ |
-| 1.7 | Run `--reclaim-only` (no purge). Confirm: monitor still attaches to the new RECLAIM_START and shows live progress; exits on RECLAIM_END. | _to fill_ |
+| 1.1 | On Linux, run `--reclaim` end-to-end. | **Skipped** (test was on Windows) |
+| 1.2 | On Windows, run `--reclaim` end-to-end. Output should match Linux line-for-line. | **Partial pass / 4 issues found.** Reclaim ran. (a) `"The process cannot access the file because it is being used by another process."` printed during undo restore (.bat file-lock vs monitor) → **fixed** by switching that step to PowerShell `FileStream(..., 'ReadWrite')`. (b) Reclaim header printed before the last BANK_STATEMENTS batches and `** PURGE COMPLETED **` had drained from monitor → **fixed** by 15s drain before reclaim header. (c) ~10 min silence between `SHRINK done` and first SQUEEZE log because cadence was every-25-iters with no wallclock floor → **fixed** by iter 1 + every 10 iters + every 60s. (d) After last iter, `** RECLAIM COMPLETED **` was buffered and only surfaced on Ctrl+C; redundant DBMS_OUTPUT flood appeared garbled → **fixed** by `SET SERVEROUTPUT OFF`, `[Console]::Out.WriteLine + Flush()` in monitor, and 15s drain after reclaim ends. **Re-test required to confirm fixes.** |
+| 1.3 | Wrapper stdout vs `logs/epf_purge_<ts>.log` identical. | **Skipped** |
+| 1.4 | Force reclaim failure → `RECLAIM_END ERROR` shows live, wrapper exits cleanly. | **Skipped** |
+| 1.5 | Verify `undo_retention=900` after run. | **Pass.** Wrapper printed `[OK] undo_retention restored to 900s`. (The "file is being used" warning was from the .bat log-append, not from the SQL itself — the SQL succeeded.) |
+| 1.6 | Force undo restore failure (wrong SYS pw) → see WARN with sqlplus output. | **Skipped** |
+| 1.7 | Ctrl+C mid-purge: no orphan monitor process. | **Skipped** (Ctrl+C was used at end-of-reclaim to surface buffered output, not a normal cancel test) |
+| 1.8 | `--reclaim-only`: monitor attaches and runs through RECLAIM_END. | **Skipped** |
+| 1.9 | SHRINK_PROGRESS cadence (every 10 tables OR 60s). | **Pass for shrink.** The pre-fix log showed `Shrunk 758 tables (skipped 9), last: OPPAYMENTS.WORKFLOW_EVENT` lines firing throughout Phase 1 with no >60s gaps. |
+| 1.10 | No leftover inline-monitor variables in `epf_purge.sh`. | **Pass** (verified via grep). |
+
+**Re-test items after follow-up fixes (please run again):**
+
+| # | Check | Observation |
+|---|-------|-------------|
+| 1F.1 | Re-run end-to-end on Windows with `--reclaim`. Confirm: no `"file is being used"` warning during undo restore. | _to fill_ |
+| 1F.2 | Confirm the `Online Tablespace Reclaim` header appears AFTER `** PURGE COMPLETED **` and after `Waiting for reclaim to start...`, with no interleaving of leftover purge batch lines. | _to fill_ |
+| 1F.3 | Confirm Phase 1 → Phase 2 transition is visible: a `SQUEEZE_PROGRESS — Phase 2 squeeze starting...` line, then `Iter 1`, `Iter 11`, `Iter 21`, ... (or 60s wallclock entries when iters are slow). No >90s silence during squeeze. | _to fill_ |
+| 1F.4 | Confirm `** RECLAIM COMPLETED **` surfaces in real time at the end (no Ctrl+C needed). | _to fill_ |
+| 1F.5 | Confirm the reclaim DBMS_OUTPUT flood (header `EPF ONLINE TABLESPACE RECLAIM`, per-iter `[N] HWM=...` lines, `RECLAIM COMPLETE` summary box) is **gone** from both stdout and the logfile. | _to fill_ |
+| 1F.6 | Confirm `[OK] Online reclaim completed` appears at the very end and the wrapper exits cleanly without hang. | _to fill_ |
 
 ---
 
@@ -156,6 +181,19 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
    - LOGS sizes will not include `op.spec_trt_log` unless we cross-schema query. Add it (separate small query as `oppayments` user requires `SELECT` on `op.spec_trt_log` segment metadata via `dba_segments`, or via `SELECT FROM op.spec_trt_log` to count bytes). We'll query `dba_segments` if grant is present, fall back to `user_segments` (which excludes spec_trt_log → footnote in prompt).
 3. **Deprecate `--show-sizes`**: keep as a no-op (still parsed, prints a deprecation note, then continues). Drop the interactive "show sizes? Y/N" prompt entirely. Update `--help`.
 
+4. **Add `--max-iterations N` flag + recommended value** (NEW — routed from Phase 1 follow-up):
+   - When auto-computing module sizes, also compute the OPPAYMENTS-default tablespace **datafile size** and **segment count above the projected target HWM** (cheap query).
+   - Recommendation heuristic (cheap and safe): `recommended_max_iter = max(2000, 50 * datafile_gb)`. So 40 GB → 2000, 120 GB → 6000, 250 GB → 12500. Cap at e.g. 20000 to avoid runaway. Show this in the reclaim prompt:
+     ```
+       Max Squeeze Iterations
+       Each iteration relocates one segment near the high water mark.
+       Larger tablespaces typically need more iterations.
+       Tablespace size: 120 GB    -> recommended: 6000 iterations
+       Enter max iterations [6000]:
+     ```
+   - Pass the chosen value into `05_reclaim_tablespace.sql` via a new SQL define (`max_iterations`, default 2000 if not supplied — back-compat).
+   - Add `--max-iterations N` flag and `MAX_ITERATIONS=N` config key.
+
 ### Test checklist (Phase 3)
 
 | # | Check | Observation |
@@ -166,6 +204,8 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 | 3.4 | `--show-sizes` flag: still accepted, prints deprecation note, behavior unchanged. | _to fill_ |
 | 3.5 | The "show sizes? Y/N" interactive prompt is gone. | _to fill_ |
 | 3.6 | If DB connection fails, the prompt falls back gracefully (no numbers, no crash). | _to fill_ |
+| 3.7 | Reclaim prompt shows recommended `max_iterations` based on tablespace size. Both interactive and `--help` document the new flag. | _to fill_ |
+| 3.8 | `--max-iterations 5000` overrides the recommendation. SQL receives the value via define. | _to fill_ |
 
 ---
 
@@ -206,6 +246,21 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
    - If status = 'ERROR' (or no RECLAIM_END row at all when `--reclaim` was requested), print a banner: `WARNING: Reclaim ended with errors — AFTER snapshot may not reflect the intended final state. See epf_purge_log for details.` Print comparison anyway.
    - Mirror in `.bat`.
 
+5. **Post-reclaim "max iterations exhausted" recommendation banner** (NEW — routed from Phase 1 follow-up):
+   - In [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql), track an exit-reason variable (`TARGET_REACHED` / `MAX_ITER_HIT` / `STALL_EXIT`). Pass it through to the `RECLAIM_END` log message.
+   - In the wrapper, after `capture_space_comparison`, if exit reason was `MAX_ITER_HIT` AND HWM > target, print a clearly-visible boxed banner:
+     ```
+     ============================================================
+       NOTE: Reclaim hit the iteration cap (X/X) before reaching
+       the target HWM. Some segments are still above target.
+       To squeeze further, re-run the reclaim phase only:
+         bin/epf_purge.sh --tns EPFPROD --user oppayments \
+           --reclaim-only --sys-password ... \
+           --max-iterations <larger N>
+     ============================================================
+     ```
+   - Compose the printed command from the actual flags used in this run (TNS, user, sys-pw redacted as `...`, larger max-iter recommendation = `2 * current`).
+
 ### Test checklist (Phase 4)
 
 | # | Check | Observation |
@@ -215,6 +270,8 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 | 4.3 | Run unattended on Linux: `EPF_PURGE_PASSWORD=… EPF_SYS_PASSWORD=… ./bin/epf_purge.sh --tns X --reclaim --assume-yes`. No prompts. | _to fill_ |
 | 4.4 | Same on Windows with `set EPF_PURGE_PASSWORD=…` and `set EPF_SYS_PASSWORD=…`. | _to fill_ |
 | 4.5 | Force reclaim failure → `capture_space_comparison` prints the WARNING banner before the comparison table. | _to fill_ |
+| 4.6 | Run reclaim with a deliberately low `--max-iterations 50` on a fragmented tablespace. Confirm the banner with the suggested re-run command appears at the very end. | _to fill_ |
+| 4.7 | Banner is NOT printed when reclaim exited via TARGET_REACHED. | _to fill_ |
 
 ---
 

@@ -42,7 +42,12 @@ if ($LogFile -ne "") {
 }
 
 function Write-Log($msg) {
-    Write-Host $msg
+    # [Console]::WriteLine bypasses Write-Host's host buffer, which can
+    # otherwise hold output for many seconds when stdout is captured by a
+    # parent cmd.exe process via Start-Process -NoNewWindow. The explicit
+    # Flush() guarantees the line is on disk/screen before we move on.
+    [Console]::Out.WriteLine($msg)
+    [Console]::Out.Flush()
     if ($script:logWriter) {
         try { $script:logWriter.WriteLine($msg) } catch { }
     }
@@ -61,7 +66,6 @@ $foundRun = $false
 $done = $false
 $idleSince = Get-Date
 $waitMsgCount = 0
-$purgeEnded = $false       # True after RUN_END seen (display-only, no timeout)
 
 while (-not $done) {
     # Build a SQL query that fetches new log entries
@@ -148,15 +152,13 @@ EXIT;
                 else {
                     Write-Log "[$ts] ** PURGE COMPLETED ** $message (total: ${elapsed}s)"
                     Write-Log "[$ts] Waiting for reclaim to start..."
-                    # Don't exit — reclaim may follow. Monitor continues until RECLAIM_END,
-                    # idle timeout, or the wrapper script kills it.
-                    $purgeEnded = $true
+                    # Don't exit -- reclaim may follow. Monitor continues until
+                    # RECLAIM_END, idle timeout, or the wrapper script kills it.
                 }
             }
             elseif ($operation -eq "RECLAIM_START") {
                 Write-Log ""
                 Write-Log "[$ts] ** RECLAIM STARTED ** $message"
-                $purgeEnded = $false  # reclaim started, reset grace period
             }
             elseif ($operation -eq "RECLAIM_END") {
                 if ($status -eq "ERROR") {

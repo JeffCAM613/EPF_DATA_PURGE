@@ -32,7 +32,13 @@
 --                             run all max_iterations (default N)
 -- ============================================================================
 
-SET SERVEROUTPUT ON SIZE UNLIMITED
+-- DBMS_OUTPUT is suppressed because the entire reclaim runs as one big
+-- PL/SQL block and DBMS_OUTPUT only flushes at block end -- producing a
+-- redundant flood of stale lines after the live monitor already showed
+-- progress via epf_purge_log. All user-visible reclaim output now flows
+-- through reclaim_log() -> epf_purge_log -> live monitor. To debug the
+-- script standalone in sqlplus, change OFF to ON.
+SET SERVEROUTPUT OFF
 SET LINESIZE 200
 SET FEEDBACK OFF
 SET VERIFY OFF
@@ -85,7 +91,15 @@ DECLARE
 
     -- run_id of the current purge run (for log entries)
     v_run_id           RAW(16) := NULL;
-    v_log_every_n      CONSTANT NUMBER := 25;  -- log squeeze progress every N iterations
+
+    -- Squeeze-progress throttling. We log iter 1 + every N iters + every N
+    -- seconds wallclock, whichever comes first. Without the wallclock floor
+    -- the user can stare at a blank screen for many minutes when individual
+    -- MOVE/REBUILD operations are slow (large segments).
+    c_squeeze_log_every_n  CONSTANT NUMBER := 10;
+    c_squeeze_log_every_s  CONSTANT NUMBER := 60;
+    v_squeeze_last_logged_iter NUMBER := 0;
+    v_squeeze_last_log_ts      TIMESTAMP := SYSTIMESTAMP;
 
     -- Cursor: find the segment whose highest extent is closest to the HWM
     -- This is the one pinning the HWM (or close to it)
@@ -344,6 +358,16 @@ BEGIN
     -- ========================================================================
     DBMS_OUTPUT.PUT_LINE('=== Phase 2: SQUEEZE (lowering HWM from '
         || ROUND(v_hwm_gb, 4) || ' to ' || ROUND(v_target_hwm_gb, 4) || ' GB) ===');
+
+    -- Live SQUEEZE_START so the monitor draws a line between Phase 1 and
+    -- Phase 2 immediately, not after the first 10 iters or 60s of silence.
+    reclaim_log('SQUEEZE_PROGRESS', 'INFO',
+        'Phase 2 squeeze starting. HWM=' || ROUND(v_hwm_gb, 4) || 'GB'
+        || ', Target=' || ROUND(v_target_hwm_gb, 4) || 'GB'
+        || ', MaxIter=' || c_max_iterations,
+        ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+    v_squeeze_last_log_ts := SYSTIMESTAMP;
+
     LOOP
         v_iteration := v_iteration + 1;
         EXIT WHEN v_iteration > c_max_iterations;
@@ -546,8 +570,16 @@ BEGIN
             v_checkpoint_hwm := v_new_hwm_gb;
         END IF;
 
-        -- Log progress to DB periodically for the live monitor
-        IF MOD(v_iteration, v_log_every_n) = 0 THEN
+        -- Log SQUEEZE_PROGRESS to epf_purge_log for the live monitor.
+        -- Triggers on iter 1 (first iteration always logged, so the user
+        -- sees motion immediately), then every N iters OR every N seconds
+        -- wallclock, whichever comes first. Without the wallclock floor,
+        -- a slow MOVE on a large segment can cause many minutes of silence.
+        IF v_iteration = 1
+           OR (v_iteration - v_squeeze_last_logged_iter) >= c_squeeze_log_every_n
+           OR (CAST(SYSTIMESTAMP AS DATE) - CAST(v_squeeze_last_log_ts AS DATE)) * 86400
+                >= c_squeeze_log_every_s
+        THEN
             reclaim_log('SQUEEZE_PROGRESS', 'INFO',
                 'Iter ' || v_iteration || '/' || c_max_iterations
                 || ', HWM=' || ROUND(v_new_hwm_gb, 4) || 'GB'
@@ -555,6 +587,8 @@ BEGIN
                 || ', Segment=' || v_seg_owner || '.' || v_seg_name
                 || ' (' || v_seg_type || ')',
                 ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+            v_squeeze_last_logged_iter := v_iteration;
+            v_squeeze_last_log_ts      := SYSTIMESTAMP;
         END IF;
 
         IF MOD(v_iteration, c_stall_check_every) = 0 THEN

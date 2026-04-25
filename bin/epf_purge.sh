@@ -968,7 +968,16 @@ SQLEOF
                 read -rsp "  SYS password: " SYS_PASSWORD
                 echo ""
             fi
+            # Drain delay: monitor polls every 10s, so the last few purge
+            # batch lines may not have surfaced yet. Without this, the reclaim
+            # header below interleaves with leftover BANK_STATEMENTS lines and
+            # the "** PURGE COMPLETED **" marker.
+            sleep 15
             execute_reclaim_online
+            # Drain delay so the monitor has a chance to fetch RECLAIM_END
+            # before stop_monitor terminates it (otherwise the final
+            # "** RECLAIM COMPLETED **" line may never surface).
+            sleep 15
         fi
     fi
 

@@ -526,8 +526,10 @@ call :log "[OK]    Purge execution completed"
 REM ============================================================================
 REM Post-purge: Restore undo_retention to Oracle default
 REM ============================================================================
-REM Capture output so we can detect (and surface) failures. Without this the
-REM purge can finish "successfully" while undo_retention stays at 60s.
+REM Use PowerShell FileStream(...,'ReadWrite') for the log append so we can
+REM share the file with the running monitor process. Plain cmd '>>' uses
+REM FILE_SHARE_READ only and fails with "file is being used by another process"
+REM because the monitor holds the same file open for write.
 if not "!SYS_PASSWORD!"=="" (
     if /i not "%DRY_RUN%"=="Y" (
         echo [INFO]  Restoring undo_retention to 900s
@@ -539,8 +541,7 @@ if not "!SYS_PASSWORD!"=="" (
             echo EXIT;
         ) > "%TEMP%\epf_undo_restore.sql"
         sqlplus -S "sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA" @"%TEMP%\epf_undo_restore.sql" > "%TEMP%\epf_undo_restore.out" 2>&1
-        set "UNDO_RC=!ERRORLEVEL!"
-        type "%TEMP%\epf_undo_restore.out" >> "%LOG_FILE%"
+        powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { Get-Content '%TEMP%\epf_undo_restore.out' | ForEach-Object { $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
         findstr /C:"undo_retention=900" "%TEMP%\epf_undo_restore.out" >nul 2>&1
         if !ERRORLEVEL! EQU 0 (
             echo [OK]    undo_retention restored to 900s
@@ -575,23 +576,31 @@ if /i "%OPTIMIZE_DB%"=="Y" (
 REM ============================================================================
 REM Space reclaim if requested (SHRINK + squeeze + resize)
 REM ============================================================================
+REM Drain delays (Start-Sleep 15s) bracket the reclaim block. The monitor polls
+REM every 10s, so without these delays:
+REM   - leftover BANK_STATEMENTS batch lines and "** PURGE COMPLETED **"
+REM     interleave with the reclaim header
+REM   - "** RECLAIM COMPLETED **" may never surface because the wrapper
+REM     terminates the monitor before its next poll
 if /i "%RECLAIM_SPACE%"=="Y" (
     if /i "%DRY_RUN%"=="Y" (
         echo [INFO]  Skipping space reclaim ^(dry run^)
     ) else (
-        echo.
-        echo   ============================================================
-        echo   Online Tablespace Reclaim ^(SHRINK + squeeze + resize^)
-        echo   ============================================================
         if "!SYS_PASSWORD!"=="" (
             echo   Space reclaim requires DBA/SYS credentials.
             for /f "usebackq delims=" %%P in (`powershell -Command "$p = Read-Host '  SYS password' -AsSecureString; [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($p))"`) do set "SYS_PASSWORD=%%P"
         )
+        powershell -Command "Start-Sleep -Seconds 15"
+        echo.
+        echo   ============================================================
+        echo   Online Tablespace Reclaim ^(SHRINK + squeeze + resize^)
+        echo   ============================================================
         echo DEFINE skip_stall_checks = !SKIP_STALL_CHECKS!> "%TEMP%\epf_reclaim_online.sql"
         echo @"%SQL_DIR%\05_reclaim_tablespace.sql">> "%TEMP%\epf_reclaim_online.sql"
         echo EXIT;>> "%TEMP%\epf_reclaim_online.sql"
         powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S 'sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA' '@%TEMP%\epf_reclaim_online.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
         del "%TEMP%\epf_reclaim_online.sql" >nul 2>&1
+        powershell -Command "Start-Sleep -Seconds 15"
         call :log "[OK]    Online reclaim completed"
     )
 )
