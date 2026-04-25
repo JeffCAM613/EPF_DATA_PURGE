@@ -526,13 +526,32 @@ call :log "[OK]    Purge execution completed"
 REM ============================================================================
 REM Post-purge: Restore undo_retention to Oracle default
 REM ============================================================================
+REM Capture output so we can detect (and surface) failures. Without this the
+REM purge can finish "successfully" while undo_retention stays at 60s.
 if not "!SYS_PASSWORD!"=="" (
     if /i not "%DRY_RUN%"=="Y" (
         echo [INFO]  Restoring undo_retention to 900s
-        echo ALTER SYSTEM SET undo_retention = 900;> "%TEMP%\epf_undo_restore.sql"
-        echo EXIT;>> "%TEMP%\epf_undo_restore.sql"
-        sqlplus -S "sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA" @"%TEMP%\epf_undo_restore.sql" >nul 2>&1
+        (
+            echo WHENEVER SQLERROR EXIT FAILURE
+            echo SET HEADING OFF FEEDBACK OFF VERIFY OFF
+            echo ALTER SYSTEM SET undo_retention = 900;
+            echo SELECT 'undo_retention=' ^|^| value FROM v$parameter WHERE name = 'undo_retention';
+            echo EXIT;
+        ) > "%TEMP%\epf_undo_restore.sql"
+        sqlplus -S "sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA" @"%TEMP%\epf_undo_restore.sql" > "%TEMP%\epf_undo_restore.out" 2>&1
+        set "UNDO_RC=!ERRORLEVEL!"
+        type "%TEMP%\epf_undo_restore.out" >> "%LOG_FILE%"
+        findstr /C:"undo_retention=900" "%TEMP%\epf_undo_restore.out" >nul 2>&1
+        if !ERRORLEVEL! EQU 0 (
+            echo [OK]    undo_retention restored to 900s
+        ) else (
+            echo [WARN]  FAILED to restore undo_retention to 900s. Current value may still be 60s.
+            echo [WARN]  Manual fix ^(as SYS^): ALTER SYSTEM SET undo_retention = 900;
+            echo [WARN]  Last sqlplus output:
+            type "%TEMP%\epf_undo_restore.out"
+        )
         del "%TEMP%\epf_undo_restore.sql" >nul 2>&1
+        del "%TEMP%\epf_undo_restore.out" >nul 2>&1
     )
 )
 

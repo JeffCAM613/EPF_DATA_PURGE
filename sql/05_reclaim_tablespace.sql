@@ -75,6 +75,10 @@ DECLARE
     v_has_lobs         NUMBER;
     v_shrink_count     NUMBER := 0;
     v_shrink_errors    NUMBER := 0;
+    v_shrink_last_logged_count NUMBER := 0;       -- progress-log throttling
+    v_shrink_last_log_ts       TIMESTAMP := SYSTIMESTAMP;
+    c_shrink_log_every_n  CONSTANT NUMBER := 10;  -- log SHRINK_PROGRESS every N tables
+    c_shrink_log_every_s  CONSTANT NUMBER := 60;  -- ...or N seconds, whichever first
     v_checkpoint_hwm   NUMBER := NULL;
     v_stall_count      NUMBER := 0;  -- consecutive stall checkpoints
     v_started          TIMESTAMP := SYSTIMESTAMP;
@@ -261,9 +265,6 @@ BEGIN
 
             v_shrink_count := v_shrink_count + 1;
 
-            -- Print progress every table (brief)
-            DBMS_OUTPUT.PUT_LINE('  SHRINK OK: ' || tbl.owner || '.' || tbl.table_name);
-
         EXCEPTION
             WHEN OTHERS THEN
                 -- Common: tables with LONG columns, clustered tables, etc.
@@ -271,6 +272,22 @@ BEGIN
                 DBMS_OUTPUT.PUT_LINE('  SHRINK SKIP: ' || tbl.owner || '.' || tbl.table_name
                     || ' (' || SQLERRM || ')');
         END;
+
+        -- Live SHRINK_PROGRESS to epf_purge_log for the monitor.
+        -- Fires every N tables OR every N seconds, whichever first.
+        IF (v_shrink_count + v_shrink_errors)
+                - v_shrink_last_logged_count >= c_shrink_log_every_n
+           OR (CAST(SYSTIMESTAMP AS DATE) - CAST(v_shrink_last_log_ts AS DATE)) * 86400
+                >= c_shrink_log_every_s
+        THEN
+            reclaim_log('SHRINK_PROGRESS', 'INFO',
+                'Shrunk ' || v_shrink_count || ' tables'
+                || ' (skipped ' || v_shrink_errors || '),'
+                || ' last: ' || tbl.owner || '.' || tbl.table_name,
+                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+            v_shrink_last_logged_count := v_shrink_count + v_shrink_errors;
+            v_shrink_last_log_ts       := SYSTIMESTAMP;
+        END IF;
     END LOOP;
 
     -- Recalculate used space and target after shrink
@@ -780,5 +797,27 @@ BEGIN
         DBMS_OUTPUT.PUT_LINE('    ' || r.member);
     END LOOP;
     DBMS_OUTPUT.PUT_LINE('  Delete any other G*_1.log files in the same directory manually.');
+
+EXCEPTION
+    -- Top-level safety net: any unhandled exception during reclaim emits a
+    -- RECLAIM_END (status=ERROR) so the live monitor terminates promptly
+    -- instead of waiting for the idle timeout. The exception is then re-raised
+    -- so the wrapper script also sees the failure.
+    WHEN OTHERS THEN
+        DECLARE
+            v_err_msg VARCHAR2(4000) := SQLERRM;
+            v_elapsed NUMBER :=
+                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400);
+        BEGIN
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('============================================================');
+            DBMS_OUTPUT.PUT_LINE('  RECLAIM FAILED');
+            DBMS_OUTPUT.PUT_LINE('============================================================');
+            DBMS_OUTPUT.PUT_LINE('  ' || v_err_msg);
+            reclaim_log('RECLAIM_END', 'ERROR',
+                'Reclaim aborted by exception: ' || SUBSTR(v_err_msg, 1, 3500),
+                v_elapsed);
+        END;
+        RAISE;
 END;
 /

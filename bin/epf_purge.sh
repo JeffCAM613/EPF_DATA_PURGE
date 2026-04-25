@@ -464,10 +464,15 @@ SQLEOF
 # ============================================================================
 # Start background progress monitor
 # ============================================================================
-# Launches a background loop that polls epf_purge_log via separate SQL*Plus
-# calls every 10s. Each poll is a fresh invocation so output is NEVER buffered
-# (unlike DBMS_OUTPUT which only flushes at block end).
+# Launches bin/epf_monitor.sh as a background process. Mirrors the Windows
+# wrapper which launches bin/epf_monitor.ps1. The monitor polls epf_purge_log
+# via SQL*Plus every 10s; each poll is a fresh invocation so output is NEVER
+# buffered (unlike DBMS_OUTPUT which only flushes at block end).
+#
+# The monitor exits on RECLAIM_END, top-level ORCHESTRATOR ERROR, idle
+# timeout, or when stop_monitor terminates it.
 MONITOR_PID=""
+MONITOR_SCRIPT="${SCRIPT_DIR}/epf_monitor.sh"
 start_monitor() {
     # Verify sqlplus is available (should be, since check_prerequisites passed)
     if ! command -v sqlplus &>/dev/null; then
@@ -476,139 +481,22 @@ start_monitor() {
         return 0
     fi
 
+    if [[ ! -f "$MONITOR_SCRIPT" ]]; then
+        log_warn "Monitor script not found: $MONITOR_SCRIPT"
+        log_warn "Purge will continue without live progress."
+        return 0
+    fi
+
+    # Ensure executable (script may arrive without +x via git on Windows)
+    [[ -x "$MONITOR_SCRIPT" ]] || chmod +x "$MONITOR_SCRIPT" 2>/dev/null || true
+
     log_info "Starting live progress monitor (polls epf_purge_log every 10s)"
 
-    (
-        local last_log_id=0
-        local run_id=""
-        local found_run=0
-        local poll_sec=10
-        local max_idle_sec=$((360 * 60))
-        local idle_start
-        idle_start=$(date +%s)
-
-        echo "[MONITOR] Started at $(date '+%Y-%m-%d %H:%M:%S')" | tee -a "$LOG_FILE"
-
-        while true; do
-            # Discover latest run_id
-            if [[ $found_run -eq 0 ]]; then
-                run_id=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'ENDSQL' 2>/dev/null | tr -d '[:space:]'
-SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300 TRIMOUT ON TRIMSPOOL ON
-SELECT RAWTOHEX(run_id) FROM (
-    SELECT run_id FROM oppayments.epf_purge_log
-    WHERE operation = 'RUN_START'
-    ORDER BY log_timestamp DESC
-) WHERE ROWNUM = 1;
-EXIT;
-ENDSQL
-                )
-                if [[ -n "$run_id" && ${#run_id} -ge 16 ]]; then
-                    found_run=1
-                    idle_start=$(date +%s)
-                    echo "[MONITOR] Tracking run_id: $run_id" | tee -a "$LOG_FILE"
-                fi
-            fi
-
-            # Fetch new entries
-            if [[ $found_run -eq 1 ]]; then
-                local output
-                output=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<ENDSQL 2>/dev/null
-SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500 TRIMOUT ON TRIMSPOOL ON
-SELECT log_id || '|' ||
-       TO_CHAR(log_timestamp, 'HH24:MI:SS') || '|' ||
-       module || '|' ||
-       operation || '|' ||
-       NVL(TO_CHAR(batch_number), '') || '|' ||
-       NVL(TO_CHAR(rows_affected), '0') || '|' ||
-       status || '|' ||
-       NVL(REPLACE(message, '|', '/'), '') || '|' ||
-       NVL(TO_CHAR(ROUND(elapsed_seconds, 1)), '') || '|' ||
-       NVL(table_name, '')
-FROM oppayments.epf_purge_log
-WHERE run_id = HEXTORAW('${run_id}')
-  AND log_id > ${last_log_id}
-ORDER BY log_id;
-EXIT;
-ENDSQL
-                )
-
-                local any_new=0
-                while IFS='|' read -r log_id ts module operation batch_num rows_aff status message elapsed tbl_name; do
-                    # Skip empty lines
-                    log_id=$(echo "$log_id" | tr -d '[:space:]')
-                    [[ -z "$log_id" ]] && continue
-
-                    any_new=1
-                    last_log_id=$log_id
-                    idle_start=$(date +%s)
-
-                    ts=$(echo "$ts" | xargs)
-                    module=$(echo "$module" | xargs)
-                    operation=$(echo "$operation" | xargs)
-                    batch_num=$(echo "$batch_num" | xargs)
-                    status=$(echo "$status" | xargs)
-                    message=$(echo "$message" | xargs)
-                    elapsed=$(echo "$elapsed" | xargs)
-
-                    local line=""
-                    if [[ "$operation" == "RUN_START" ]]; then
-                        line="[$ts] ** PURGE STARTED ** $message"
-                    elif [[ "$operation" == "RUN_END" ]]; then
-                        line="[$ts] ** PURGE COMPLETED ** $message (total: ${elapsed}s)"
-                        echo "$line" | tee -a "$LOG_FILE"
-                        exit 0
-                    elif [[ "$operation" == "DELETE" && -n "$batch_num" ]]; then
-                        line="[$ts] $(printf '%-12s' "$module") batch $(printf '%5s' "$batch_num")  $message  (${elapsed}s)"
-                    elif [[ "$status" == "ERROR" ]]; then
-                        line="[$ts] *** ERROR *** $module - $message"
-                        echo "$line" | tee -a "$LOG_FILE"
-                        exit 1
-                    elif [[ "$operation" =~ DRY_RUN_COUNT|INFO|INIT ]]; then
-                        line="[$ts] $(printf '%-12s' "$module") $message"
-                    elif [[ -n "$message" ]]; then
-                        line="[$ts] $(printf '%-12s' "$module") $message"
-                    fi
-
-                    [[ -n "$line" ]] && echo "$line" | tee -a "$LOG_FILE"
-                done <<< "$output"
-
-                # If no new activity, check for a newer run_id (handles cancelled/restarted runs)
-                if [[ $any_new -eq 0 && $last_log_id -gt 0 ]]; then
-                    local latest_id
-                    latest_id=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'ENDSQL' 2>/dev/null | tr -d '[:space:]'
-SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300 TRIMOUT ON TRIMSPOOL ON
-SELECT RAWTOHEX(run_id) FROM (
-    SELECT run_id FROM oppayments.epf_purge_log
-    WHERE operation = 'RUN_START'
-    ORDER BY log_timestamp DESC
-) WHERE ROWNUM = 1;
-EXIT;
-ENDSQL
-                    )
-                    if [[ -n "$latest_id" && ${#latest_id} -ge 16 && "$latest_id" != "$run_id" ]]; then
-                        echo "" | tee -a "$LOG_FILE"
-                        echo "[MONITOR] Newer run detected: $latest_id (was $run_id)" | tee -a "$LOG_FILE"
-                        echo "[MONITOR] Switching to new run_id..." | tee -a "$LOG_FILE"
-                        echo "" | tee -a "$LOG_FILE"
-                        run_id="$latest_id"
-                        last_log_id=0
-                        idle_start=$(date +%s)
-                    fi
-                fi
-            fi
-
-            # Check timeout
-            local now
-            now=$(date +%s)
-            local idle=$(( now - idle_start ))
-            if [[ $idle -gt $max_idle_sec ]]; then
-                echo "[MONITOR] Timeout after $((idle / 60)) min of inactivity." | tee -a "$LOG_FILE"
-                exit 0
-            fi
-
-            sleep "$poll_sec"
-        done
-    ) &
+    bash "$MONITOR_SCRIPT" \
+        "${USERNAME}/${PASSWORD}@${TNS_NAME}" \
+        10 \
+        360 \
+        "$LOG_FILE" &
     MONITOR_PID=$!
     # Give the monitor a moment to connect
     sleep 2
@@ -720,10 +608,31 @@ restore_undo_post_purge() {
         sys_connect="${SYS_USER}/${SYS_PASSWORD}@${TNS_NAME}"
     fi
 
-    sqlplus -S "${sys_connect}" <<'SQLEOF' >/dev/null 2>&1
+    # Capture output so we can detect (and surface) failures. Without this the
+    # purge can finish "successfully" while undo_retention stays at 60s.
+    local restore_out
+    restore_out=$(sqlplus -S "${sys_connect}" <<'SQLEOF' 2>&1
+WHENEVER SQLERROR EXIT FAILURE
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
 ALTER SYSTEM SET undo_retention = 900;
+SELECT 'undo_retention=' || value FROM v$parameter WHERE name = 'undo_retention';
 EXIT;
 SQLEOF
+    )
+    local rc=$?
+    echo "$restore_out" >> "$LOG_FILE"
+
+    if [[ $rc -ne 0 ]] || echo "$restore_out" | grep -qi "ORA-\|SP2-"; then
+        log_warn "FAILED to restore undo_retention to 900s. Current value may still be 60s."
+        log_warn "Manual fix (as SYS): ALTER SYSTEM SET undo_retention = 900;"
+        log_warn "Last sqlplus output:"
+        echo "$restore_out" | sed 's/^/    /' | tee -a "$LOG_FILE" >&2
+    elif echo "$restore_out" | grep -q "undo_retention=900"; then
+        log_ok "undo_retention restored to 900s"
+    else
+        log_warn "undo_retention restore command ran but verification did not confirm 900s."
+        log_warn "Output: $(echo "$restore_out" | tr -d '\n')"
+    fi
 }
 
 # ============================================================================

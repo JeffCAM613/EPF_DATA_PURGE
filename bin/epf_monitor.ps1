@@ -141,11 +141,17 @@ EXIT;
                 Write-Log "[$ts] ** PURGE STARTED ** $message"
             }
             elseif ($operation -eq "RUN_END") {
-                Write-Log "[$ts] ** PURGE COMPLETED ** $message (total: ${elapsed}s)"
-                Write-Log "[$ts] Waiting for reclaim to start..."
-                # Don't exit — reclaim may follow. Monitor continues until RECLAIM_END,
-                # idle timeout, or the wrapper script kills it.
-                $purgeEnded = $true
+                if ($status -eq "ERROR") {
+                    Write-Log "[$ts] *** PURGE FAILED *** $message"
+                    $done = $true
+                }
+                else {
+                    Write-Log "[$ts] ** PURGE COMPLETED ** $message (total: ${elapsed}s)"
+                    Write-Log "[$ts] Waiting for reclaim to start..."
+                    # Don't exit — reclaim may follow. Monitor continues until RECLAIM_END,
+                    # idle timeout, or the wrapper script kills it.
+                    $purgeEnded = $true
+                }
             }
             elseif ($operation -eq "RECLAIM_START") {
                 Write-Log ""
@@ -153,13 +159,18 @@ EXIT;
                 $purgeEnded = $false  # reclaim started, reset grace period
             }
             elseif ($operation -eq "RECLAIM_END") {
-                Write-Log "[$ts] ** RECLAIM COMPLETED ** $message (total: ${elapsed}s)"
+                if ($status -eq "ERROR") {
+                    Write-Log "[$ts] *** RECLAIM FAILED *** $message"
+                }
+                else {
+                    Write-Log "[$ts] ** RECLAIM COMPLETED ** $message (total: ${elapsed}s)"
+                }
                 $done = $true
             }
             elseif ($operation -eq "SHRINK_DONE") {
                 Write-Log "[$ts] RECLAIM      Phase 1 SHRINK done: $message (${elapsed}s)"
             }
-            elseif ($operation -eq "SQUEEZE_PROGRESS") {
+            elseif ($operation -eq "SHRINK_PROGRESS" -or $operation -eq "SQUEEZE_PROGRESS") {
                 Write-Log "[$ts] RECLAIM      $message (${elapsed}s)"
             }
             elseif ($operation -eq "DELETE" -and $batchNum -ne "") {
