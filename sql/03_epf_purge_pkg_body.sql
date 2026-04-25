@@ -85,23 +85,32 @@ AS
         l_tables t_table_list;
     BEGIN
         l_tables(1)  := 'oppayments.bulk_payment_additional_info';
-        l_tables(2)  := 'oppayments.payment_audit';
-        l_tables(3)  := 'oppayments.import_audit';
-        l_tables(4)  := 'oppayments.transmission_execution_audit';
-        l_tables(5)  := 'oppayments.transmission_execution';
-        l_tables(6)  := 'oppayments.transmission_exception';
-        l_tables(7)  := 'oppayments.notification_execution';
-        l_tables(8)  := 'oppayments.approbation_execution';
-        l_tables(9)  := 'oppayments.workflow_execution';
-        l_tables(10) := 'oppayments.payment_additional_info';
-        l_tables(11) := 'oppayments.payment';
-        l_tables(12) := 'oppayments.bulk_payment';
-        l_tables(13) := 'oppayments.file_integration';
-        l_tables(14) := 'oppayments.audit_archive';
-        l_tables(15) := 'oppayments.audit_trail';
-        l_tables(16) := 'op.spec_trt_log';
-        l_tables(17) := 'oppayments.directory_dispatching';
-        l_tables(18) := 'oppayments.file_dispatching';
+        l_tables(2)  := 'oppayments.bulk_signature';
+        l_tables(3)  := 'oppayments.mandatory_signers';
+        l_tables(4)  := 'oppayments.oidc_request_token';
+        l_tables(5)  := 'oppayments.payment_audit';
+        l_tables(6)  := 'oppayments.import_audit_messages';
+        l_tables(7)  := 'oppayments.import_audit';
+        l_tables(8)  := 'oppayments.transmission_execution_audit';
+        l_tables(9)  := 'oppayments.transmission_execution';
+        l_tables(10) := 'oppayments.transmission_exception';
+        l_tables(11) := 'oppayments.notification_execution';
+        l_tables(12) := 'oppayments.approbation_execution';
+        l_tables(13) := 'oppayments.approbation_execution_opt';
+        l_tables(14) := 'oppayments.workflow_execution';
+        l_tables(15) := 'oppayments.workflow_execution_opt';
+        l_tables(16) := 'oppayments.bulkpayment_exception';
+        l_tables(17) := 'oppayments.invoice_additional_info';
+        l_tables(18) := 'oppayments.invoice';
+        l_tables(19) := 'oppayments.payment_additional_info';
+        l_tables(20) := 'oppayments.payment';
+        l_tables(21) := 'oppayments.bulk_payment';
+        l_tables(22) := 'oppayments.file_integration';
+        l_tables(23) := 'oppayments.audit_archive';
+        l_tables(24) := 'oppayments.audit_trail';
+        l_tables(25) := 'op.spec_trt_log';
+        l_tables(26) := 'oppayments.directory_dispatching';
+        l_tables(27) := 'oppayments.file_dispatching';
         RETURN l_tables;
     END get_purged_tables;
 
@@ -624,17 +633,6 @@ AS
             l_rows_deleted := SQL%ROWCOUNT;
             l_total_dd := l_total_dd + l_rows_deleted;
 
-            log_entry(
-                p_run_id          => p_run_id,
-                p_module          => 'BANK_STATEMENTS',
-                p_operation       => 'DELETE',
-                p_table_name      => 'oppayments.directory_dispatching',
-                p_rows_affected   => l_rows_deleted,
-                p_batch_number    => l_batch_count,
-                p_status          => 'SUCCESS',
-                p_elapsed_seconds => get_elapsed_seconds(l_batch_start, SYSTIMESTAMP)
-            );
-
             -- Delete file_dispatching (parent table)
             -- Use direct delete with deduplication to handle one-to-many relationship
             FORALL i IN 1..l_fd_ids.COUNT
@@ -645,14 +643,13 @@ AS
                       WHERE dd2.file_dispatching_id = l_fd_ids(i)
                   );
 
-            l_rows_deleted := SQL%ROWCOUNT;
-            l_total_fd := l_total_fd + l_rows_deleted;
+            l_total_fd := l_total_fd + SQL%ROWCOUNT;
 
+            -- Single per-batch log entry
             log_entry(
                 p_run_id          => p_run_id,
                 p_module          => 'BANK_STATEMENTS',
                 p_operation       => 'DELETE',
-                p_table_name      => 'oppayments.file_dispatching',
                 p_rows_affected   => l_rows_deleted,
                 p_batch_number    => l_batch_count,
                 p_status          => 'SUCCESS',
@@ -695,12 +692,16 @@ AS
     -- ========================================================================
     -- purge_bulk_payments
     -- ========================================================================
-    -- The most complex module. Purges bulk payments and all 12 dependent
+    -- The most complex module. Purges bulk payments and all 21 dependent
     -- child tables in correct FK-dependency order using BULK COLLECT + FORALL.
     --
-    -- Optimization: payment_ids and execution_ids are collected ONCE per batch
-    -- and reused across all dependent table deletes (instead of repeating the
-    -- same subquery 4+ times per row as the original script did).
+    -- Performance optimizations (v2):
+    --   1. payment_ids are collected ONCE per batch into a nested table
+    --      (oppayments.epf_number_tab) and reused across all 7 payment-level
+    --      deletes — eliminates 6 redundant joins per batch.
+    --   2. Default batch size raised to 5000 (was 1000).
+    --   3. DBMS_APPLICATION_INFO updates V$SESSION every batch so progress is
+    --      visible instantly from another session without querying the log table.
     PROCEDURE purge_bulk_payments(
         p_run_id      IN RAW,
         p_cutoff_date IN DATE,
@@ -708,10 +709,8 @@ AS
         p_dry_run     IN BOOLEAN  DEFAULT FALSE
     )
     IS
-        l_bp_ids       SYS.ODCINUMBERLIST;   -- bulk_payment_id values for current batch
-        -- Derived id collections (payment_ids, execution_ids) are not materialized:
-        -- with batch_size=5000 and fan-out they can exceed the 32767 VARRAY limit
-        -- (ORA-22165). Child deletes use nested IN (SELECT ... FROM TABLE(l_bp_ids)).
+        l_bp_ids       SYS.ODCINUMBERLIST;           -- bulk_payment_id values for current batch
+        l_pay_ids      oppayments.epf_number_tab;    -- payment_ids materialised ONCE per batch
         l_batch_count  NUMBER := 0;
         l_rows_deleted NUMBER;
         l_start_ts     TIMESTAMP;
@@ -719,15 +718,24 @@ AS
 
         -- Per-table running totals
         l_tot_bp_addl  NUMBER := 0;
+        l_tot_bulk_sig NUMBER := 0;
+        l_tot_mand_sign NUMBER := 0;
+        l_tot_oidc_req NUMBER := 0;
         l_tot_pay_aud1 NUMBER := 0;  -- payment_audit by bulk_payment_id
-        l_tot_imp_aud  NUMBER := 0;
         l_tot_tx_aud   NUMBER := 0;
+        l_tot_imp_msg  NUMBER := 0;
+        l_tot_imp_aud  NUMBER := 0;
+        l_tot_notif    NUMBER := 0;
         l_tot_tx_exec  NUMBER := 0;
         l_tot_tx_exc   NUMBER := 0;
-        l_tot_notif    NUMBER := 0;
+        l_tot_approv_opt NUMBER := 0;
+        l_tot_wf_opt   NUMBER := 0;
         l_tot_approv   NUMBER := 0;
         l_tot_wf_exec  NUMBER := 0;
         l_tot_pay_aud2 NUMBER := 0;  -- payment_audit by payment_id
+        l_tot_bp_exc   NUMBER := 0;
+        l_tot_inv_addl NUMBER := 0;
+        l_tot_invoice  NUMBER := 0;
         l_tot_pay_addl NUMBER := 0;
         l_tot_payment  NUMBER := 0;
         l_tot_bp       NUMBER := 0;
@@ -789,104 +797,182 @@ AS
             EXIT WHEN l_bp_ids.COUNT = 0;
 
             -- =============================================================
+            -- OPTIMIZATION: Materialise payment_ids ONCE per batch.
+            -- Avoids repeating the payment join 7 times per batch.
+            -- Uses oppayments.epf_number_tab (schema-level nested table)
+            -- so there is no VARRAY 32K limit.
+            -- =============================================================
+            SELECT payment_id BULK COLLECT INTO l_pay_ids
+            FROM oppayments.payment
+            WHERE bulk_payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_bp_ids));
+
+            -- =============================================================
             -- DELETE in FK-dependency order (leaves first, root last)
             -- =============================================================
 
-            -- 1. bulk_payment_additional_info (direct FK on bulk_payment_id)
+            -- 1. bulk_payment_additional_info (FK to bulk_payment)
             FORALL i IN 1..l_bp_ids.COUNT
                 DELETE FROM oppayments.bulk_payment_additional_info
                 WHERE bulk_payment_id = l_bp_ids(i);
             l_rows_deleted := SQL%ROWCOUNT;
             l_tot_bp_addl := l_tot_bp_addl + l_rows_deleted;
 
-            -- 2. payment_audit (direct FK on bulk_payment_id)
+            -- 2. bulk_signature (FK to bulk_payment)
+            FORALL i IN 1..l_bp_ids.COUNT
+                DELETE FROM oppayments.bulk_signature
+                WHERE bulk_payment_id = l_bp_ids(i);
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_bulk_sig := l_tot_bulk_sig + l_rows_deleted;
+
+            -- 3. mandatory_signers (FK to bulk_payment)
+            FORALL i IN 1..l_bp_ids.COUNT
+                DELETE FROM oppayments.mandatory_signers
+                WHERE bulk_payment_id = l_bp_ids(i);
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_mand_sign := l_tot_mand_sign + l_rows_deleted;
+
+            -- 4. oidc_request_token (FK to bulk_payment)
+            FORALL i IN 1..l_bp_ids.COUNT
+                DELETE FROM oppayments.oidc_request_token
+                WHERE bulk_payment_id = l_bp_ids(i);
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_oidc_req := l_tot_oidc_req + l_rows_deleted;
+
+            -- 5. payment_audit (by bulk_payment_id)
             FORALL i IN 1..l_bp_ids.COUNT
                 DELETE FROM oppayments.payment_audit
                 WHERE bulk_payment_id = l_bp_ids(i);
             l_rows_deleted := SQL%ROWCOUNT;
             l_tot_pay_aud1 := l_tot_pay_aud1 + l_rows_deleted;
 
-            -- 3. import_audit (direct FK on bulk_payment_id)
-            FORALL i IN 1..l_bp_ids.COUNT
-                DELETE FROM oppayments.import_audit
-                WHERE bulk_payment_id = l_bp_ids(i);
-            l_rows_deleted := SQL%ROWCOUNT;
-            l_tot_imp_aud := l_tot_imp_aud + l_rows_deleted;
-
-            -- 4. transmission_execution_audit (direct FK on bulk_payment_id)
+            -- 6. transmission_execution_audit (FK to transmission_execution
+            --    AND possibly import_audit via IMPORT_AUDIT_ID_FK)
+            --    Must be deleted BEFORE both import_audit and transmission_execution
             FORALL i IN 1..l_bp_ids.COUNT
                 DELETE FROM oppayments.transmission_execution_audit
                 WHERE bulk_payment_id = l_bp_ids(i);
             l_rows_deleted := SQL%ROWCOUNT;
             l_tot_tx_aud := l_tot_tx_aud + l_rows_deleted;
 
-            -- 5. transmission_execution (direct FK on bulk_payment_id)
-            FORALL i IN 1..l_bp_ids.COUNT
-                DELETE FROM oppayments.transmission_execution
-                WHERE bulk_payment_id = l_bp_ids(i);
+            -- 7. import_audit_messages (FK to import_audit via IMPORT_AUDIT_ID_FK)
+            --    Must be deleted BEFORE import_audit
+            DELETE FROM oppayments.import_audit_messages
+            WHERE import_audit_id IN (
+                SELECT import_audit_id FROM oppayments.import_audit
+                WHERE bulk_payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_bp_ids))
+            );
             l_rows_deleted := SQL%ROWCOUNT;
-            l_tot_tx_exec := l_tot_tx_exec + l_rows_deleted;
+            l_tot_imp_msg := l_tot_imp_msg + l_rows_deleted;
 
-            -- 6. transmission_exception (direct FK on bulk_payment_id)
-            FORALL i IN 1..l_bp_ids.COUNT
-                DELETE FROM oppayments.transmission_exception
-                WHERE bulk_payment_id = l_bp_ids(i);
-            l_rows_deleted := SQL%ROWCOUNT;
-            l_tot_tx_exc := l_tot_tx_exc + l_rows_deleted;
-
-            -- 7. notification_execution (direct FK on bulk_payment_id)
+            -- 7b. notification_execution (FK to import_audit AND transmission_execution)
+            --    Must be deleted BEFORE both import_audit and transmission_execution
             FORALL i IN 1..l_bp_ids.COUNT
                 DELETE FROM oppayments.notification_execution
                 WHERE bulk_payment_id = l_bp_ids(i);
             l_rows_deleted := SQL%ROWCOUNT;
             l_tot_notif := l_tot_notif + l_rows_deleted;
 
-            -- 8. approbation_execution (deepest indirect: via workflow_execution -> payment)
+            -- 8. import_audit (FK to bulk_payment)
+            --    Now safe: import_audit_messages + notification_execution + tex_audit deleted
+            FORALL i IN 1..l_bp_ids.COUNT
+                DELETE FROM oppayments.import_audit
+                WHERE bulk_payment_id = l_bp_ids(i);
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_imp_aud := l_tot_imp_aud + l_rows_deleted;
+
+            -- 9. transmission_execution (FK to bulk_payment AND transmission_exception)
+            --    Now safe: notification_execution + tex_audit already deleted
+            FORALL i IN 1..l_bp_ids.COUNT
+                DELETE FROM oppayments.transmission_execution
+                WHERE bulk_payment_id = l_bp_ids(i);
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_tx_exec := l_tot_tx_exec + l_rows_deleted;
+
+            -- 10. transmission_exception (FK to bulk_payment)
+            FORALL i IN 1..l_bp_ids.COUNT
+                DELETE FROM oppayments.transmission_exception
+                WHERE bulk_payment_id = l_bp_ids(i);
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_tx_exc := l_tot_tx_exc + l_rows_deleted;
+
+            -- 11. approbation_execution_opt (FK to workflow_execution_opt)
+            DELETE FROM oppayments.approbation_execution_opt
+            WHERE execution_id IN (
+                SELECT execution_id FROM oppayments.workflow_execution_opt
+                WHERE bulk_payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_bp_ids))
+            );
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_approv_opt := l_tot_approv_opt + l_rows_deleted;
+
+            -- 12. workflow_execution_opt (FK to bulk_payment)
+            FORALL i IN 1..l_bp_ids.COUNT
+                DELETE FROM oppayments.workflow_execution_opt
+                WHERE bulk_payment_id = l_bp_ids(i);
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_wf_opt := l_tot_wf_opt + l_rows_deleted;
+
+            -- ============================================================
+            -- Payment-level deletes: use materialised l_pay_ids
+            -- (eliminates 6 redundant joins to the payment table)
+            -- ============================================================
+
+            -- 13. approbation_execution (FK to workflow_execution)
             DELETE FROM oppayments.approbation_execution
             WHERE execution_id IN (
                 SELECT we.execution_id
                 FROM oppayments.workflow_execution we
-                JOIN oppayments.payment p ON p.payment_id = we.payment_id
-                WHERE p.bulk_payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_bp_ids))
+                WHERE we.payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_pay_ids))
             );
             l_rows_deleted := SQL%ROWCOUNT;
             l_tot_approv := l_tot_approv + l_rows_deleted;
 
-            -- 9. workflow_execution (via payment)
+            -- 14. workflow_execution (via payment)
             DELETE FROM oppayments.workflow_execution
-            WHERE payment_id IN (
-                SELECT payment_id FROM oppayments.payment
-                WHERE bulk_payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_bp_ids))
-            );
+            WHERE payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_pay_ids));
             l_rows_deleted := SQL%ROWCOUNT;
             l_tot_wf_exec := l_tot_wf_exec + l_rows_deleted;
 
-            -- 10. payment_audit (indirect: via payment_id)
+            -- 15. payment_audit (indirect: via payment_id)
             DELETE FROM oppayments.payment_audit
-            WHERE payment_id IN (
-                SELECT payment_id FROM oppayments.payment
-                WHERE bulk_payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_bp_ids))
-            );
+            WHERE payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_pay_ids));
             l_rows_deleted := SQL%ROWCOUNT;
             l_tot_pay_aud2 := l_tot_pay_aud2 + l_rows_deleted;
 
-            -- 11. payment_additional_info (via payment)
-            DELETE FROM oppayments.payment_additional_info
-            WHERE payment_id IN (
-                SELECT payment_id FROM oppayments.payment
-                WHERE bulk_payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_bp_ids))
+            -- 16. bulkpayment_exception (FK to payment)
+            DELETE FROM oppayments.bulkpayment_exception
+            WHERE payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_pay_ids));
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_bp_exc := l_tot_bp_exc + l_rows_deleted;
+
+            -- 17. invoice_additional_info (FK to invoice)
+            DELETE FROM oppayments.invoice_additional_info
+            WHERE invoice_id IN (
+                SELECT invoice_id FROM oppayments.invoice
+                WHERE payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_pay_ids))
             );
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_inv_addl := l_tot_inv_addl + l_rows_deleted;
+
+            -- 18. invoice (FK to payment)
+            DELETE FROM oppayments.invoice
+            WHERE payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_pay_ids));
+            l_rows_deleted := SQL%ROWCOUNT;
+            l_tot_invoice := l_tot_invoice + l_rows_deleted;
+
+            -- 19. payment_additional_info (via payment)
+            DELETE FROM oppayments.payment_additional_info
+            WHERE payment_id IN (SELECT COLUMN_VALUE FROM TABLE(l_pay_ids));
             l_rows_deleted := SQL%ROWCOUNT;
             l_tot_pay_addl := l_tot_pay_addl + l_rows_deleted;
 
-            -- 12. payment (mid-level)
+            -- 20. payment (mid-level)
             FORALL i IN 1..l_bp_ids.COUNT
                 DELETE FROM oppayments.payment
                 WHERE bulk_payment_id = l_bp_ids(i);
             l_rows_deleted := SQL%ROWCOUNT;
             l_tot_payment := l_tot_payment + l_rows_deleted;
 
-            -- 13. bulk_payment (root)
+            -- 21. bulk_payment (root)
             FORALL i IN 1..l_bp_ids.COUNT
                 DELETE FROM oppayments.bulk_payment
                 WHERE bulk_payment_id = l_bp_ids(i);
@@ -895,34 +981,67 @@ AS
 
             COMMIT;
 
+            -- Update V$SESSION so progress is visible from another session
+            -- via: SELECT module, action, client_info FROM v$session WHERE ...
+            DBMS_APPLICATION_INFO.SET_MODULE(
+                module_name => 'EPF_PURGE',
+                action_name => 'PAYMENTS batch ' || l_batch_count
+            );
+            DBMS_APPLICATION_INFO.SET_CLIENT_INFO(
+                'bp=' || l_tot_bp || ' pay=' || l_tot_payment
+                || ' elapsed=' || ROUND(get_elapsed_seconds(l_start_ts, SYSTIMESTAMP), 0) || 's'
+            );
+
+            -- Log every batch (autonomous transaction = immediately queryable
+            -- from another session via epf_purge_log)
             log_entry(
                 p_run_id          => p_run_id,
                 p_module          => 'PAYMENTS',
                 p_operation       => 'DELETE',
                 p_table_name      => 'oppayments.bulk_payment (batch)',
-                p_rows_affected   => l_rows_deleted,
+                p_rows_affected   => l_bp_ids.COUNT,
                 p_batch_number    => l_batch_count,
                 p_status          => 'SUCCESS',
                 p_message         => 'Batch ' || l_batch_count || ': '
-                                     || l_bp_ids.COUNT || ' bulk payments processed',
+                                     || l_tot_bp || ' bulk_payment, '
+                                     || l_tot_payment || ' payment deleted so far',
                 p_elapsed_seconds => get_elapsed_seconds(l_batch_start, SYSTIMESTAMP)
             );
         END LOOP;
         CLOSE c_bulk_payments;
+
+        -- Clear V$SESSION info
+        DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+        DBMS_APPLICATION_INFO.SET_CLIENT_INFO(NULL);
 
         -- Log per-table totals
         log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
             p_table_name => 'oppayments.bulk_payment_additional_info',
             p_rows_affected => l_tot_bp_addl, p_status => 'SUCCESS');
         log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
+            p_table_name => 'oppayments.bulk_signature',
+            p_rows_affected => l_tot_bulk_sig, p_status => 'SUCCESS');
+        log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
+            p_table_name => 'oppayments.mandatory_signers',
+            p_rows_affected => l_tot_mand_sign, p_status => 'SUCCESS');
+        log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
+            p_table_name => 'oppayments.oidc_request_token',
+            p_rows_affected => l_tot_oidc_req, p_status => 'SUCCESS');
+        log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
             p_table_name => 'oppayments.payment_audit (by bulk_payment_id)',
             p_rows_affected => l_tot_pay_aud1, p_status => 'SUCCESS');
+        log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
+            p_table_name => 'oppayments.transmission_execution_audit',
+            p_rows_affected => l_tot_tx_aud, p_status => 'SUCCESS');
+        log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
+            p_table_name => 'oppayments.import_audit_messages',
+            p_rows_affected => l_tot_imp_msg, p_status => 'SUCCESS');
         log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
             p_table_name => 'oppayments.import_audit',
             p_rows_affected => l_tot_imp_aud, p_status => 'SUCCESS');
         log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
-            p_table_name => 'oppayments.transmission_execution_audit',
-            p_rows_affected => l_tot_tx_aud, p_status => 'SUCCESS');
+            p_table_name => 'oppayments.notification_execution',
+            p_rows_affected => l_tot_notif, p_status => 'SUCCESS');
         log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
             p_table_name => 'oppayments.transmission_execution',
             p_rows_affected => l_tot_tx_exec, p_status => 'SUCCESS');
@@ -930,8 +1049,11 @@ AS
             p_table_name => 'oppayments.transmission_exception',
             p_rows_affected => l_tot_tx_exc, p_status => 'SUCCESS');
         log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
-            p_table_name => 'oppayments.notification_execution',
-            p_rows_affected => l_tot_notif, p_status => 'SUCCESS');
+            p_table_name => 'oppayments.approbation_execution_opt',
+            p_rows_affected => l_tot_approv_opt, p_status => 'SUCCESS');
+        log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
+            p_table_name => 'oppayments.workflow_execution_opt',
+            p_rows_affected => l_tot_wf_opt, p_status => 'SUCCESS');
         log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
             p_table_name => 'oppayments.approbation_execution',
             p_rows_affected => l_tot_approv, p_status => 'SUCCESS');
@@ -941,6 +1063,15 @@ AS
         log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
             p_table_name => 'oppayments.payment_audit (by payment_id)',
             p_rows_affected => l_tot_pay_aud2, p_status => 'SUCCESS');
+        log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
+            p_table_name => 'oppayments.bulkpayment_exception',
+            p_rows_affected => l_tot_bp_exc, p_status => 'SUCCESS');
+        log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
+            p_table_name => 'oppayments.invoice_additional_info',
+            p_rows_affected => l_tot_inv_addl, p_status => 'SUCCESS');
+        log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
+            p_table_name => 'oppayments.invoice',
+            p_rows_affected => l_tot_invoice, p_status => 'SUCCESS');
         log_entry(p_run_id => p_run_id, p_module => 'PAYMENTS', p_operation => 'DELETE',
             p_table_name => 'oppayments.payment_additional_info',
             p_rows_affected => l_tot_pay_addl, p_status => 'SUCCESS');
@@ -959,24 +1090,33 @@ AS
             p_status          => 'SUCCESS',
             p_message         => 'Completed. bulk_payment: ' || l_tot_bp
                                  || ', payment: ' || l_tot_payment
-                                 || ' (+ all dependent records across 13 tables)',
+                                 || ' (+ all dependent records across 21 tables)',
             p_elapsed_seconds => get_elapsed_seconds(l_start_ts, SYSTIMESTAMP)
         );
 
         DBMS_OUTPUT.PUT_LINE('=== Bulk Payments Purge Summary ===');
         DBMS_OUTPUT.PUT_LINE('  bulk_payment:                    ' || l_tot_bp);
         DBMS_OUTPUT.PUT_LINE('  bulk_payment_additional_info:    ' || l_tot_bp_addl);
+        DBMS_OUTPUT.PUT_LINE('  bulk_signature:                  ' || l_tot_bulk_sig);
+        DBMS_OUTPUT.PUT_LINE('  mandatory_signers:               ' || l_tot_mand_sign);
+        DBMS_OUTPUT.PUT_LINE('  oidc_request_token:              ' || l_tot_oidc_req);
         DBMS_OUTPUT.PUT_LINE('  payment:                         ' || l_tot_payment);
         DBMS_OUTPUT.PUT_LINE('  payment_additional_info:         ' || l_tot_pay_addl);
         DBMS_OUTPUT.PUT_LINE('  payment_audit (by bp_id):        ' || l_tot_pay_aud1);
         DBMS_OUTPUT.PUT_LINE('  payment_audit (by payment_id):   ' || l_tot_pay_aud2);
+        DBMS_OUTPUT.PUT_LINE('  import_audit_messages:            ' || l_tot_imp_msg);
         DBMS_OUTPUT.PUT_LINE('  import_audit:                    ' || l_tot_imp_aud);
         DBMS_OUTPUT.PUT_LINE('  transmission_execution_audit:    ' || l_tot_tx_aud);
         DBMS_OUTPUT.PUT_LINE('  transmission_execution:          ' || l_tot_tx_exec);
         DBMS_OUTPUT.PUT_LINE('  transmission_exception:          ' || l_tot_tx_exc);
         DBMS_OUTPUT.PUT_LINE('  notification_execution:          ' || l_tot_notif);
         DBMS_OUTPUT.PUT_LINE('  workflow_execution:              ' || l_tot_wf_exec);
+        DBMS_OUTPUT.PUT_LINE('  workflow_execution_opt:          ' || l_tot_wf_opt);
         DBMS_OUTPUT.PUT_LINE('  approbation_execution:           ' || l_tot_approv);
+        DBMS_OUTPUT.PUT_LINE('  approbation_execution_opt:       ' || l_tot_approv_opt);
+        DBMS_OUTPUT.PUT_LINE('  bulkpayment_exception:           ' || l_tot_bp_exc);
+        DBMS_OUTPUT.PUT_LINE('  invoice_additional_info:         ' || l_tot_inv_addl);
+        DBMS_OUTPUT.PUT_LINE('  invoice:                         ' || l_tot_invoice);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -1274,16 +1414,17 @@ AS
         DBMS_OUTPUT.PUT_LINE('------------------------------------------------------------');
 
         -- Per-module summary
+        -- Include DRY_RUN_COUNT rows so dry-run reports show expected counts
         FOR rec IN (
             SELECT module,
-                   SUM(CASE WHEN status IN ('SUCCESS') AND operation != 'DRY_RUN_COUNT'
+                   SUM(CASE WHEN status IN ('SUCCESS')
                        THEN rows_affected ELSE 0 END) AS total_rows,
                    SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) AS errors,
                    SUM(CASE WHEN status = 'WARNING' THEN 1 ELSE 0 END) AS warnings,
-                   ROUND(SUM(NVL(elapsed_seconds, 0)), 1) AS total_seconds
+                   ROUND(MAX(NVL(elapsed_seconds, 0)), 1) AS total_seconds
             FROM oppayments.epf_purge_log
             WHERE run_id = p_run_id
-              AND operation NOT IN ('INIT')
+              AND operation NOT IN ('INIT', 'RUN_START', 'RUN_END')
             GROUP BY module
             ORDER BY module
         ) LOOP
@@ -1312,53 +1453,93 @@ AS
     -- ========================================================================
     -- capture_space_snapshot
     -- ========================================================================
-    -- Captures segment sizes for all OPPAYMENTS objects (tables, indexes, LOBs)
-    -- into epf_purge_space_snapshot. Resolves LOB segment names to their
-    -- parent table using dba_lobs (falls back to user_lobs if no DBA access).
+    -- Captures segment sizes for ALL objects in the OPPAYMENTS default
+    -- tablespace (not just OPPAYMENTS-owned) so totals match the reclaim
+    -- script which also measures by tablespace.  Resolves LOB segment names
+    -- to their parent table using dba_lobs.
+    -- Falls back to user_segments if DBA views are not accessible (but totals
+    -- will then only cover the current user's segments).
     PROCEDURE capture_space_snapshot(
         p_run_id         IN RAW,
         p_snapshot_phase IN VARCHAR2
     )
     IS
         PRAGMA AUTONOMOUS_TRANSACTION;
+        v_tablespace VARCHAR2(128);
+        v_dba_sql    VARCHAR2(4000);
     BEGIN
-        -- Insert all segments for the OPPAYMENTS owner.
-        -- Resolves LOB segments to parent table via dba_lobs / user_lobs.
+        -- Determine the OPPAYMENTS default tablespace (user_users needs no DBA grants)
         BEGIN
-            -- Try DBA view first (works if user has SELECT on dba_segments/dba_lobs)
-            EXECUTE IMMEDIATE '
-                INSERT INTO oppayments.epf_purge_space_snapshot
-                    (run_id, snapshot_phase, owner, segment_name, segment_type,
-                     parent_table, size_bytes, size_mb)
-                SELECT :run_id, :phase, s.owner, s.segment_name, s.segment_type,
-                       NVL(l.table_name, s.segment_name) AS parent_table,
-                       SUM(s.bytes), ROUND(SUM(s.bytes) / 1048576, 2)
-                FROM dba_segments s
-                LEFT JOIN dba_lobs l
-                    ON  l.owner = s.owner
-                    AND l.segment_name = s.segment_name
-                WHERE s.owner = ''OPPAYMENTS''
-                GROUP BY s.owner, s.segment_name, s.segment_type, l.table_name'
-            USING p_run_id, p_snapshot_phase;
+            SELECT default_tablespace INTO v_tablespace FROM user_users;
+        EXCEPTION
+            WHEN OTHERS THEN v_tablespace := NULL;
+        END;
+
+        -- Build DBA query: capture ALL segments in the tablespace so totals
+        -- match the reclaim script (which also measures by tablespace).
+        v_dba_sql :=
+            'INSERT INTO oppayments.epf_purge_space_snapshot
+                (run_id, snapshot_phase, owner, segment_name, segment_type,
+                 parent_table, size_bytes, size_mb)
+            SELECT :run_id, :phase, sg.owner, sg.segment_name, sg.segment_type,
+                   COALESCE(l.table_name, sg.segment_name) AS parent_table,
+                   sg.total_bytes, ROUND(sg.total_bytes / 1048576, 2)
+            FROM (
+                SELECT owner, segment_name, segment_type, SUM(bytes) AS total_bytes
+                FROM dba_segments
+                WHERE tablespace_name = :ts
+                GROUP BY owner, segment_name, segment_type
+            ) sg
+            LEFT JOIN (
+                SELECT owner, segment_name, MIN(table_name) AS table_name
+                FROM dba_lobs
+                GROUP BY owner, segment_name
+            ) l ON l.owner = sg.owner AND l.segment_name = sg.segment_name';
+
+        DBMS_OUTPUT.PUT_LINE('[SNAPSHOT] Phase: ' || p_snapshot_phase
+            || ' | Tablespace: ' || NVL(v_tablespace, '(unknown)'));
+
+        BEGIN
+            EXECUTE IMMEDIATE v_dba_sql USING p_run_id, p_snapshot_phase, v_tablespace;
         EXCEPTION
             WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('[SNAPSHOT] DBA path failed: ' || SQLERRM);
+                DBMS_OUTPUT.PUT_LINE('[SNAPSHOT] Falling back to user_segments (current user only)...');
+                DBMS_OUTPUT.PUT_LINE('[SNAPSHOT] WARNING: Totals will NOT match the reclaim report.');
+                DBMS_OUTPUT.PUT_LINE('[SNAPSHOT] To fix, run as SYS:');
+                DBMS_OUTPUT.PUT_LINE('[SNAPSHOT]   GRANT SELECT ON sys.dba_segments TO oppayments;');
+                DBMS_OUTPUT.PUT_LINE('[SNAPSHOT]   GRANT SELECT ON sys.dba_lobs TO oppayments;');
                 -- Fall back to user_segments / user_lobs (no DBA privileges)
                 INSERT INTO oppayments.epf_purge_space_snapshot
                     (run_id, snapshot_phase, owner, segment_name, segment_type,
                      parent_table, size_bytes, size_mb)
-                SELECT p_run_id, p_snapshot_phase, USER, s.segment_name, s.segment_type,
-                       NVL(l.table_name, s.segment_name) AS parent_table,
-                       SUM(s.bytes), ROUND(SUM(s.bytes) / 1048576, 2)
-                FROM user_segments s
-                LEFT JOIN user_lobs l
-                    ON l.segment_name = s.segment_name
-                GROUP BY s.segment_name, s.segment_type, l.table_name;
+                SELECT p_run_id, p_snapshot_phase, USER, sg.segment_name, sg.segment_type,
+                       COALESCE(l.table_name, sg.segment_name) AS parent_table,
+                       sg.total_bytes, ROUND(sg.total_bytes / 1048576, 2)
+                FROM (
+                    SELECT segment_name, segment_type, SUM(bytes) AS total_bytes
+                    FROM user_segments
+                    GROUP BY segment_name, segment_type
+                ) sg
+                LEFT JOIN (
+                    SELECT segment_name, MIN(table_name) AS table_name
+                    FROM user_lobs
+                    GROUP BY segment_name
+                ) l ON l.segment_name = sg.segment_name;
         END;
 
-        COMMIT;
+        DECLARE
+            v_cnt NUMBER;
+        BEGIN
+            SELECT COUNT(*) INTO v_cnt
+            FROM oppayments.epf_purge_space_snapshot
+            WHERE run_id = p_run_id AND snapshot_phase = p_snapshot_phase;
 
-        DBMS_OUTPUT.PUT_LINE('Space snapshot captured: ' || p_snapshot_phase
-            || ' (' || SQL%ROWCOUNT || ' segments)');
+            COMMIT;
+
+            DBMS_OUTPUT.PUT_LINE('Space snapshot captured: ' || p_snapshot_phase
+                || ' (' || v_cnt || ' segments)');
+        END;
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -1369,8 +1550,9 @@ AS
     -- ========================================================================
     -- print_space_comparison
     -- ========================================================================
-    -- Prints a before/after comparison of segment sizes, grouped by parent
-    -- table (so LOB segments roll up into their parent table's total).
+    -- Prints a before/after comparison of segment sizes, grouped by
+    -- owner + parent table (so LOB segments roll up into their parent
+    -- table's total, and cross-schema segments are shown separately).
     PROCEDURE print_space_comparison(p_run_id IN RAW)
     IS
         l_total_before NUMBER := 0;
@@ -1382,16 +1564,17 @@ AS
         DBMS_OUTPUT.PUT_LINE('  Run ID: ' || RAWTOHEX(p_run_id));
         DBMS_OUTPUT.PUT_LINE('============================================================');
         DBMS_OUTPUT.PUT_LINE(
-            RPAD('Segment / Table', 38)
+            RPAD('Owner.Segment / Table', 42)
             || LPAD('Before(MB)', 12)
             || LPAD('After(MB)', 12)
             || LPAD('Freed(MB)', 12)
             || LPAD('Freed%', 8)
         );
-        DBMS_OUTPUT.PUT_LINE(RPAD('-', 82, '-'));
+        DBMS_OUTPUT.PUT_LINE(RPAD('-', 86, '-'));
 
         FOR rec IN (
-            SELECT NVL(b.parent_table, a.parent_table) AS parent_table,
+            SELECT NVL(b.owner, a.owner) AS owner,
+                   NVL(b.parent_table, a.parent_table) AS parent_table,
                    NVL(b.total_mb, 0) AS before_mb,
                    NVL(a.total_mb, 0) AS after_mb,
                    NVL(b.total_mb, 0) - NVL(a.total_mb, 0) AS freed_mb,
@@ -1401,23 +1584,23 @@ AS
                         ELSE 0
                    END AS freed_pct
             FROM (
-                SELECT parent_table, SUM(size_mb) AS total_mb
+                SELECT owner, parent_table, SUM(size_mb) AS total_mb
                 FROM oppayments.epf_purge_space_snapshot
                 WHERE run_id = p_run_id AND snapshot_phase = 'BEFORE'
-                GROUP BY parent_table
+                GROUP BY owner, parent_table
             ) b
             FULL OUTER JOIN (
-                SELECT parent_table, SUM(size_mb) AS total_mb
+                SELECT owner, parent_table, SUM(size_mb) AS total_mb
                 FROM oppayments.epf_purge_space_snapshot
                 WHERE run_id = p_run_id AND snapshot_phase = 'AFTER'
-                GROUP BY parent_table
-            ) a ON b.parent_table = a.parent_table
+                GROUP BY owner, parent_table
+            ) a ON b.owner = a.owner AND b.parent_table = a.parent_table
             ORDER BY NVL(b.total_mb, 0) DESC
         ) LOOP
             -- Only show segments > 0.01 MB to avoid noise
             IF rec.before_mb >= 0.01 OR rec.after_mb >= 0.01 THEN
                 DBMS_OUTPUT.PUT_LINE(
-                    RPAD(rec.parent_table, 38)
+                    RPAD(rec.owner || '.' || rec.parent_table, 42)
                     || LPAD(TO_CHAR(rec.before_mb, '999,990.00'), 12)
                     || LPAD(TO_CHAR(rec.after_mb, '999,990.00'), 12)
                     || LPAD(TO_CHAR(rec.freed_mb, '999,990.00'), 12)
@@ -1428,9 +1611,9 @@ AS
             END IF;
         END LOOP;
 
-        DBMS_OUTPUT.PUT_LINE(RPAD('-', 82, '-'));
+        DBMS_OUTPUT.PUT_LINE(RPAD('-', 86, '-'));
         DBMS_OUTPUT.PUT_LINE(
-            RPAD('TOTAL (OPPAYMENTS)', 38)
+            RPAD('TOTAL (TABLESPACE)', 42)
             || LPAD(TO_CHAR(l_total_before, '999,990.00'), 12)
             || LPAD(TO_CHAR(l_total_after, '999,990.00'), 12)
             || LPAD(TO_CHAR(l_total_before - l_total_after, '999,990.00'), 12)
@@ -1441,10 +1624,10 @@ AS
                    END, 8)
         );
         DBMS_OUTPUT.PUT_LINE('============================================================');
-        DBMS_OUTPUT.PUT_LINE('NOTE: Segment sizes reflect allocated space, not actual data.');
-        DBMS_OUTPUT.PUT_LINE('Space freed by DELETE is reusable by Oracle but does not');
-        DBMS_OUTPUT.PUT_LINE('reduce OS disk usage. Use --reclaim or SHRINK SPACE to');
-        DBMS_OUTPUT.PUT_LINE('compact segments, then RESIZE datafiles to free OS disk.');
+        DBMS_OUTPUT.PUT_LINE('NOTE: With DBA views, totals cover the full tablespace and');
+        DBMS_OUTPUT.PUT_LINE('should match the reclaim report. Without DBA views, only');
+        DBMS_OUTPUT.PUT_LINE('the current user''s segments are included (totals will be');
+        DBMS_OUTPUT.PUT_LINE('lower than the reclaim report).');
         DBMS_OUTPUT.PUT_LINE('============================================================');
 
     EXCEPTION
@@ -1559,9 +1742,10 @@ AS
             );
         END IF;
 
-        -- Capture space usage AFTER purge.
-        -- NOTE: disk-level reclamation is handled outside the package by the
-        -- epf_tablespace_reclaim tool (export/import/recreate-as-BIGFILE).
+        -- Capture space usage AFTER purge (rows deleted, but segments not yet compacted).
+        -- NOTE: If --reclaim is used, the wrapper script will capture a second AFTER
+        -- snapshot post-reclaim and print the comparison then, which is more meaningful
+        -- since DELETE alone does not change segment sizes.
         capture_space_snapshot(l_run_id, 'AFTER');
 
         -- Log run end
@@ -1576,9 +1760,6 @@ AS
 
         -- Print summary
         print_run_summary(l_run_id);
-
-        -- Print space comparison (before vs after)
-        print_space_comparison(l_run_id);
 
     EXCEPTION
         WHEN OTHERS THEN

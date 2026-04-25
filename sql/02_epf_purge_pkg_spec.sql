@@ -12,7 +12,7 @@
 --       oppayments.epf_purge_pkg.run_purge(
 --           p_retention_days => 90,
 --           p_purge_depth    => 'ALL',
---           p_batch_size     => 1000,
+--           p_batch_size     => 5000,
 --           p_dry_run        => FALSE
 --       );
 --
@@ -36,7 +36,7 @@ AS
     -- Constants: defaults
     -- ========================================================================
     C_DEFAULT_RETENTION_DAYS CONSTANT NUMBER := 30;
-    C_DEFAULT_BATCH_SIZE     CONSTANT NUMBER := 1000;
+    C_DEFAULT_BATCH_SIZE     CONSTANT NUMBER := 5000;
 
     -- ========================================================================
     -- Collection types (used for BULK COLLECT operations)
@@ -55,7 +55,7 @@ AS
     --   p_retention_days  - Data older than this many days is purged (default 30)
     --   p_purge_depth     - Which modules to purge: ALL, PAYMENTS, LOGS,
     --                       or BANK_STATEMENTS (default ALL)
-    --   p_batch_size      - Number of parent records per batch commit (default 1000)
+    --   p_batch_size      - Number of parent records per batch commit (default 5000)
     --   p_dry_run         - If TRUE, counts rows but does not delete anything
     PROCEDURE run_purge(
         p_retention_days   IN NUMBER   DEFAULT C_DEFAULT_RETENTION_DAYS,

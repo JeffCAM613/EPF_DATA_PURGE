@@ -1,115 +1,279 @@
-# EPF Data Purge Tool
+# EPF Data Purge — User Guide
 
-Automated purge tool for the ePF (electronic Payment Factory) Oracle database. Removes expired data from the `oppayments` schema based on configurable retention policies, with full audit logging and optional space reclamation.
+> A simplified, user-friendly guide to the EPF Data Purge tool.
+> For full technical details, see [EPF_PURGE_FULL_DOCUMENTATION.md](EPF_PURGE_FULL_DOCUMENTATION.md).
 
-## Prerequisites
+---
 
-- **Oracle SQL*Plus** installed and on PATH
-- **ORACLE_HOME** environment variable set (recommended)
-- **Database user** with the following privileges:
-  - `DELETE` on all `oppayments` tables listed below
-  - `CREATE TABLE` (for the audit log table)
-  - `CREATE PROCEDURE` (for the PL/SQL package)
-  - `DBA` role (only if using datafile resize in space reclamation)
+## What Is This Tool?
 
-## Quick Start
+The **EPF Data Purge Tool** cleans up old data from the ePF (electronic Payment Factory) Oracle database. Over time, the database accumulates payment records, audit logs, and bank statement files that are no longer needed. Without cleanup, the database grows unbounded — slowing down queries, lengthening backups, and wasting disk space.
 
-### Windows
+This tool **safely deletes** data older than a configurable number of days, logs everything it does, and optionally reclaims disk space.
+
+---
+
+## What Does It Do?
+
+| Feature | Description |
+|---------|-------------|
+| **Purge old data** | Deletes payment records, audit logs, and bank statements older than N days (default: 30). |
+| **Configurable retention** | Choose how many days of data to keep. Different modules can use different retentions. |
+| **Dry-run mode** | Preview exactly what would be deleted — without deleting anything. Always do this first. |
+| **Full audit log** | Every operation is logged to a database table (`epf_purge_log`) with row counts, timing, and errors. |
+| **Batch processing** | Deletes in configurable batches (default: 1,000 rows) to avoid long-running transactions. |
+| **Space reclamation** | Optionally compacts the database and shrinks datafiles on disk after deleting data. |
+| **Live monitoring** | A separate monitor shows real-time progress during long purges. |
+| **Selective purge** | Choose to purge only payments, only logs, or only bank statements. |
+| **Cross-platform** | Works on Windows (`.bat`) and Linux (`.sh`). |
+
+---
+
+## Requirements
+
+| Requirement | Details |
+|-------------|---------|
+| **Oracle SQL*Plus** | Must be installed and on your system PATH. |
+| **ORACLE_HOME** | Environment variable set to your Oracle client directory (recommended). |
+| **Database user: `oppayments`** | Needs `DELETE` on all purged tables, `CREATE TABLE`, `CREATE PROCEDURE`, `CREATE TYPE`. |
+| **DBA view grants** | For accurate space comparison: `GRANT SELECT ON sys.dba_segments TO oppayments; GRANT SELECT ON sys.dba_lobs TO oppayments;` (auto-applied when SYS password is provided). |
+| **SYS / DBA user** | Only needed for space reclamation (`--reclaim`) or DB optimization (`--optimize-db`). |
+| **Disk space** | The purge itself uses minimal disk. Space reclamation (`--reclaim`) is online and needs no extra space. |
+
+---
+
+## How to Run
+
+### 1. Interactive Mode (Recommended for First Time)
+
+Just run the script — it will prompt you for everything:
+
 ```cmd
+:: Windows
+cd C:\path\to\EPF_DATA_PURGE
 bin\epf_purge.bat
-```
 
-### Linux
-```bash
+:: Linux
+cd /path/to/EPF_DATA_PURGE
 chmod +x bin/epf_purge.sh
 ./bin/epf_purge.sh
 ```
 
-The wrapper script will prompt you for all required inputs with explanations.
+### 2. Dry Run First (Always Recommended)
 
-### Dry Run (Recommended First Step)
+See how many rows would be deleted, without deleting anything:
 
-Always run a dry run first to see how many rows would be deleted without actually deleting anything:
-
-```bash
-# Linux
-./bin/epf_purge.sh --tns EPFPROD --user oppayments --retention 90 --dry-run
-
-# Windows
+```cmd
+:: Windows
 bin\epf_purge.bat --tns EPFPROD --user oppayments --retention 90 --dry-run
+
+:: Linux
+./bin/epf_purge.sh --tns EPFPROD --user oppayments --retention 90 --dry-run
 ```
+
+### 3. Actual Purge
+
+```cmd
+bin\epf_purge.bat --tns EPFPROD --user oppayments --retention 90 --batch-size 5000
+```
+
+### 4. Purge + Space Reclamation
+
+```cmd
+bin\epf_purge.bat --tns EPFPROD --user oppayments --retention 90 --reclaim --sys-password MySysPass
+```
+
+### 5. Purge a Specific Module Only
+
+```cmd
+:: Only payments (90-day retention)
+bin\epf_purge.bat --tns EPFPROD --user oppayments --depth PAYMENTS --retention 90
+
+:: Only logs (30-day retention)
+bin\epf_purge.bat --tns EPFPROD --user oppayments --depth LOGS --retention 30
+
+:: Only bank statements (60-day retention)
+bin\epf_purge.bat --tns EPFPROD --user oppayments --depth BANK_STATEMENTS --retention 60
+```
+
+---
 
 ## Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--tns NAME` | *(required)* | Oracle TNS name or connect string (e.g., `EPFPROD`, `localhost:1521/orcl`) |
-| `--user NAME` | `oppayments` | Database username |
-| `--password PASS` | *(prompted)* | Database password (prefer `EPF_PURGE_PASSWORD` env var) |
-| `--retention N` | `30` | Purge data older than N days |
-| `--depth DEPTH` | `ALL` | Which modules to purge (see below) |
-| `--batch-size N` | `1000` | Rows per batch commit. Larger = faster, more undo space |
-| `--dry-run` | off | Count rows only, no actual deletes |
-| `--reclaim` | off | Reclaim space after purge (SHRINK + COALESCE + RESIZE if DBA) |
-| `--drop-pkg` | off | Drop the PL/SQL package after execution |
-| `--config FILE` | *(none)* | Load settings from config file |
+| `--tns NAME` | *(required)* | Oracle TNS name or connect string (e.g., `EPFPROD`, `localhost:1521/orcl`). |
+| `--user NAME` | `oppayments` | Database username. |
+| `--password PASS` | *(prompted)* | Database password. Prefer using the `EPF_PURGE_PASSWORD` environment variable instead. |
+| `--retention N` | `30` | Delete data older than N days. |
+| `--depth DEPTH` | `ALL` | Which module to purge: `ALL`, `PAYMENTS`, `LOGS`, or `BANK_STATEMENTS`. |
+| `--batch-size N` | `1000` | Number of rows per batch. Larger = faster but uses more UNDO space. |
+| `--dry-run` | off | Count affected rows without deleting. Always run this first. |
+| `--optimize-db` | off | Pre-purge optimization: enlarge redo logs to 1 GB and gather optimizer stats. Needs SYS. |
+| `--reclaim` | off | Post-purge space reclamation: SHRINK segments + squeeze + resize datafiles. Needs SYS. |
+| `--reclaim-only` | off | Skip the purge, only reclaim space. Useful if you already purged earlier. |
+| `--no-stall-check` | off | Disable stall detection during space reclamation. |
+| `--drop-pkg` | off | Remove the PL/SQL package from the database after the purge finishes. |
+| `--drop-logs` | off | Remove the audit log tables (`epf_purge_log`, `epf_purge_space_snapshot`). They will be recreated on next run. |
+| `--sys-password PASS` | *(prompted)* | Password for SYS (only needed for `--optimize-db` and `--reclaim`). |
+| `--assume-yes` / `-y` | off | Skip all confirmation prompts. For automated/scheduled runs. |
+| `--config FILE` | *(none)* | Load settings from a config file instead of command-line arguments. |
 
 ### Purge Depth Options
 
-| Depth | Modules Purged |
-|-------|---------------|
-| `ALL` | Payments + Logs + Bank Statements (everything) |
-| `PAYMENTS` | Bulk payments, individual payments, and file integrations |
-| `LOGS` | Audit trails, audit archives, and technical logs |
-| `BANK_STATEMENTS` | Bank statement file and directory dispatching |
+| Depth | What Gets Purged |
+|-------|-----------------|
+| `ALL` | Everything below — payments, logs, and bank statements. |
+| `PAYMENTS` | Bulk payments + 20 child tables + file integrations. |
+| `LOGS` | Audit trail + audit archive + technical logs. |
+| `BANK_STATEMENTS` | File dispatching + directory dispatching records. |
 
-## What Gets Purged
+---
 
-### PAYMENTS Module (14 tables)
+## What Gets Purged — All 27 Tables
 
-Deletes bulk payments and all dependent child records based on `bulk_payment.value_date`:
+The tool deletes data from **27 tables** across two schemas (`oppayments` and `op`), organized into three modules. Tables are deleted in a specific order to respect foreign key constraints: **children are always deleted before their parents**.
 
-| Table | Relationship |
-|-------|-------------|
-| `bulk_payment` | Root table |
-| `bulk_payment_additional_info` | Direct child of bulk_payment |
-| `payment` | Direct child of bulk_payment |
-| `payment_additional_info` | Child of payment |
-| `payment_audit` | Child of both bulk_payment and payment |
-| `import_audit` | Direct child of bulk_payment |
-| `transmission_execution` | Direct child of bulk_payment |
-| `transmission_execution_audit` | Direct child of bulk_payment |
-| `transmission_exception` | Direct child of bulk_payment |
-| `notification_execution` | Direct child of bulk_payment |
-| `workflow_execution` | Child of payment |
-| `approbation_execution` | Child of workflow_execution |
-| `file_integration` | Based on `integration_date` |
+### PAYMENTS Module — 22 tables
 
-### LOGS Module (3 tables)
+The root table is `bulk_payment`. Everything else is a child or grandchild. The date filter is `bulk_payment.value_date < cutoff`.
 
-| Table | Date Column |
-|-------|------------|
-| `audit_trail` | `audit_timestamp` |
-| `audit_archive` | Via `audit_trail.audit_archive_id` |
-| `op.spec_trt_log` | `dtlog` |
+```
+bulk_payment  ← ROOT (filtered by value_date)
+│
+├── bulk_payment_additional_info      (direct child)
+├── bulk_signature                    (direct child)
+├── mandatory_signers                 (direct child)
+├── oidc_request_token                (direct child)
+├── payment_audit (by bulk_payment_id)(direct child)
+├── transmission_execution_audit  [*] (direct child — contains CLOB: message)
+├── import_audit_messages             (grandchild via import_audit)
+├── import_audit                      (direct child)
+├── notification_execution            (direct child)
+├── transmission_execution            (direct child)
+├── transmission_exception            (direct child)
+├── approbation_execution_opt         (grandchild via workflow_execution_opt)
+├── workflow_execution_opt            (direct child)
+│
+└── payment  (direct child of bulk_payment)
+    │
+    ├── approbation_execution         (grandchild via workflow_execution)
+    ├── workflow_execution            (child of payment)
+    ├── payment_audit (by payment_id) (child of payment)
+    ├── bulkpayment_exception         (child of payment)
+    ├── invoice_additional_info       (grandchild via invoice)
+    ├── invoice                       (child of payment)
+    └── payment_additional_info       (child of payment)
 
-### BANK_STATEMENTS Module (2 tables)
+file_integration  ← SEPARATE (filtered by integration_date)
+```
 
-| Table | Date Column |
-|-------|------------|
-| `file_dispatching` | `date_reception` |
-| `directory_dispatching` | Via `file_dispatching` join |
 
-## Purge Log (Audit Trail)
+**Tables with CLOB columns:**
 
-All purge operations are recorded in `oppayments.epf_purge_log`. This table is created automatically on first run and is **not** dropped when the package is removed.
+| Table | CLOB Column | Impact |
+|-------|------------|--------|
+| `transmission_execution_audit` | `message` | Stores XML/text message content. Deleting rows generates extra UNDO for LOB data. |
 
-### Querying the Log
+### LOGS Module — 3 tables
+
+| Table | Schema | Date Filter | Relationship |
+|-------|--------|-------------|-------------|
+| `audit_archive` | `oppayments` | FK from `audit_trail` | Child — deleted first |
+| `audit_trail` | `oppayments` | `audit_timestamp < cutoff` | Parent |
+| `spec_trt_log` | **`op`** | `dtlog < cutoff` | Standalone (no FK) |
+
+### BANK_STATEMENTS Module — 2 tables
+
+| Table | Schema | Date Filter | Relationship | CLOB Column |
+|-------|--------|-------------|-------------|-------------|
+| `directory_dispatching` | `oppayments` | FK from `file_dispatching` | Child — deleted first | `breakdown_content` |
+| `file_dispatching` | `oppayments` | `date_reception < cutoff` | Parent | `file_content` |
+
+Both tables contain **CLOB columns** that store file contents and breakdown data. These generate more UNDO per row during deletion than regular tables.
+
+---
+
+## General Execution Flow
+
+When you run the tool, here is what happens step by step:
+
+```
+1. PARSE         Parse command-line arguments / load config file / interactive prompts
+                           │
+2. CHECK         Verify prerequisites: sqlplus available, ORACLE_HOME set, DB connectivity
+                           │
+3. OPTIMIZE      (Optional, --optimize-db) Enlarge redo logs, gather stats
+                           │
+4. DEPLOY        Run SQL scripts to create the log table and PL/SQL package
+                 01_create_purge_log_table.sql → 02_epf_purge_pkg_spec.sql → 03_epf_purge_pkg_body.sql
+                           │
+5. VERIFY        Check the package compiled without errors
+                           │
+6. TUNE UNDO     Lower undo_retention from 900s to 60s (prevents UNDO tablespace from growing to 25GB+)
+                           │
+7. MONITOR       Start the live progress monitor (background)
+                           │
+8. PURGE         Execute the purge:
+                   • Snapshot segment sizes (BEFORE)
+                   • Delete PAYMENTS (21 tables, batch by batch)
+                   • Delete FILE_INTEGRATIONS (batch by batch)
+                   • Delete AUDIT_LOGS (2 tables, batch by batch)
+                   • Delete TECH_LOGS (op.spec_trt_log, batch by batch)
+                   • Delete BANK_STATEMENTS (2 tables, batch by batch)
+                   • Snapshot segment sizes (AFTER)
+                   • Print run summary + space comparison
+                           │
+9. RESTORE       Stop monitor, restore undo_retention to 900s
+                           │
+10. RECLAIM      (Optional, --reclaim) Shrink segments + squeeze + resize datafiles
+                           │
+11. CLEANUP      (Optional) Drop package (--drop-pkg), drop logs (--drop-logs)
+                           │
+12. LOG          Write timestamped log file to logs/ directory
+```
+
+---
+
+## Impact and Safety
+
+### What You Can Expect
+
+| Aspect | Detail |
+|--------|--------|
+| **Online operation** | The purge runs while the application is live. It uses row-level locks and batched commits — it does not block normal ePF transactions. |
+| **Disk space** | After purge, Oracle marks freed space as "reusable" but the datafile stays the same size on disk. Use `--reclaim` to actually shrink the files. |
+| **Duration** | Depends on data volume. Dry runs take seconds. Purging ~500K bulk_payments with all dependents takes roughly 1–3 hours. |
+| **Redo logs** | The tool generates redo (write-ahead log entries). With `--optimize-db`, redo logs are enlarged to 1 GB to prevent `log file switch` waits. |
+| **UNDO tablespace** | Batched commits keep per-transaction UNDO small. The wrapper script automatically tunes `undo_retention` to 60s during purge and restores it to 900s after. |
+| **Interruption safety** | If the purge is interrupted (Ctrl+C, crash), already-committed batches are permanent. The current batch rolls back cleanly. Re-run the purge — it picks up where it left off (selects by date, not by state). |
+| **Application impact** | Minimal. The purge deletes old data (older than retention period). Active transactions on current data are not affected. Prefer off-hours for very large purges to minimize I/O contention. |
+
+### Safety Features
+
+| Feature | What It Does |
+|---------|-------------|
+| **Dry run** (`--dry-run`) | Counts rows that *would* be deleted. Deletes nothing. Always run this first. |
+| **Batch commits** | Commits every N rows (default 1,000). Keeps transactions small. |
+| **UNDO tuning** | Automatically lowers `undo_retention` to prevent UNDO tablespace from growing to 25+ GB. |
+| **Per-batch error handling** | If one batch fails, it rolls back that batch and continues with the next. One bad record doesn't abort the entire purge. |
+| **Full audit trail** | Every DELETE, every count, every error is logged to `epf_purge_log` with timestamps and row counts. |
+| **Autonomous logging** | Log entries use Oracle autonomous transactions — they survive even if the main transaction rolls back. |
+| **Cursor cleanup** | All database cursors are explicitly closed on error (prevents resource leaks). |
+| **Confirmation prompts** | The wrapper script asks for confirmation before executing. Use `-y` to skip in automated runs. |
+| **Privilege separation** | Normal purge runs as `oppayments` (limited privileges). SYS is only used for reclaim/optimization, and only when you explicitly ask for it. |
+
+---
+
+## Checking Results
+
+### Quick Summary After Purge
+
+The tool automatically prints a summary after each run. You can also query it:
 
 ```sql
 -- Summary of the most recent run
 SELECT module, status, SUM(rows_affected) AS total_rows,
-       COUNT(*) AS operations,
        ROUND(SUM(NVL(elapsed_seconds, 0)), 1) AS elapsed_sec
 FROM oppayments.epf_purge_log
 WHERE run_id = (
@@ -120,354 +284,145 @@ WHERE run_id = (
 )
 GROUP BY module, status
 ORDER BY module, status;
+```
 
--- Detailed view of a specific run
-SELECT log_timestamp, module, operation, table_name,
-       rows_affected, status, message
-FROM oppayments.epf_purge_log
-WHERE run_id = HEXTORAW('your_run_id_here')
-ORDER BY log_timestamp;
+### Check for Errors
 
--- Error history
+```sql
 SELECT log_timestamp, module, table_name, error_code, error_message
 FROM oppayments.epf_purge_log
 WHERE status = 'ERROR'
 ORDER BY log_timestamp DESC;
 ```
 
-### Log Table Columns
-
-| Column | Description |
-|--------|------------|
-| `log_id` | Auto-increment primary key |
-| `run_id` | GUID linking all entries from one execution |
-| `log_timestamp` | When the entry was recorded |
-| `module` | PAYMENTS, FILE_INTEGRATION, AUDIT_LOGS, TECH_LOGS, BANK_STATEMENTS, SPACE_RECLAIM |
-| `operation` | DELETE, DRY_RUN_COUNT, SHRINK_SPACE, COALESCE, RESIZE, RUN_START, RUN_END |
-| `table_name` | Fully qualified table name affected |
-| `rows_affected` | Number of rows deleted in this operation |
-| `batch_number` | Batch sequence number within a module |
-| `retention_days` | Retention parameter used for this run |
-| `status` | SUCCESS, ERROR, WARNING, INFO |
-| `message` | Descriptive text |
-| `error_code` | Oracle SQLCODE on errors |
-| `error_message` | Oracle SQLERRM on errors |
-| `elapsed_seconds` | Duration of this operation |
-
-### Space Snapshot Table: `oppayments.epf_purge_space_snapshot`
-
-Automatically captures segment sizes before and after each purge run.
-
-| Column | Description |
-|--------|------------|
-| `snapshot_id` | Auto-increment primary key |
-| `run_id` | Links to the purge run |
-| `snapshot_phase` | BEFORE or AFTER |
-| `snapshot_timestamp` | When the snapshot was taken |
-| `owner` | Schema owner |
-| `segment_name` | Oracle segment name (table, index, or LOB segment) |
-| `segment_type` | TABLE, INDEX, LOBSEGMENT, etc. |
-| `parent_table` | For LOB segments, the parent table name; otherwise same as segment_name |
-| `size_bytes` | Segment size in bytes |
-| `size_mb` | Segment size in MB |
-
-## Example Output
-
-### Dry Run
-```
-============================================================
-  EPF DATA PURGE
-  Run ID:     A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4
-  Depth:      ALL
-  Retention:  90 days
-  Cutoff:     2025-12-19
-  Batch size: 1000
-  Dry run:    YES
-============================================================
-[DRY RUN] bulk_payment: 4523, payment: 28450 (and dependents) would be deleted
-[DRY RUN] file_integration: 1205 rows would be deleted
-[DRY RUN] audit_trail: 156780, audit_archive: 156780 rows would be deleted
-[DRY RUN] op.spec_trt_log: 89432 rows would be deleted
-[DRY RUN] directory_dispatching: 3400, file_dispatching: 1700 rows would be deleted
-
-============================================================
-  EPF PURGE RUN SUMMARY
-  Run ID: A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4
-============================================================
-  Started:  2026-03-19 14:30:00
-  Finished: 2026-03-19 14:30:05
-  Duration: 5.0s
-------------------------------------------------------------
-  AUDIT_LOGS            Rows:          0  Errors: 0  Warnings: 0  Time: 1.2s
-  BANK_STATEMENTS       Rows:          0  Errors: 0  Warnings: 0  Time: 0.8s
-  FILE_INTEGRATION      Rows:          0  Errors: 0  Warnings: 0  Time: 0.3s
-  PAYMENTS              Rows:          0  Errors: 0  Warnings: 0  Time: 2.1s
-  TECH_LOGS             Rows:          0  Errors: 0  Warnings: 0  Time: 0.6s
-------------------------------------------------------------
-  TOTAL ROWS DELETED: 0
-============================================================
-```
-
-### Actual Purge
-```
-============================================================
-  EPF DATA PURGE
-  Run ID:     F7E8D9C0B1A2F7E8D9C0B1A2F7E8D9C0
-  Depth:      ALL
-  Retention:  90 days
-  Cutoff:     2025-12-19
-  Batch size: 1000
-  Dry run:    NO
-============================================================
-=== Bulk Payments Purge Summary ===
-  bulk_payment:                    4,523
-  bulk_payment_additional_info:    4,523
-  payment:                         28,450
-  payment_additional_info:         28,450
-  payment_audit (by bp_id):        4,523
-  payment_audit (by payment_id):   28,450
-  import_audit:                    4,523
-  transmission_execution_audit:    4,523
-  transmission_execution:          4,523
-  transmission_exception:          312
-  notification_execution:          4,523
-  workflow_execution:              28,450
-  approbation_execution:           56,900
-file_integration: 1,205 rows deleted
-audit_trail: 156,780, audit_archive: 156,780 rows deleted
-op.spec_trt_log: 89,432 rows deleted
-directory_dispatching: 3,400, file_dispatching: 1,700 rows deleted
-
-============================================================
-  SPACE USAGE COMPARISON (Before vs After Purge)
-  Run ID: F7E8D9C0B1A2F7E8D9C0B1A2F7E8D9C0
-============================================================
-Segment / Table                        Before(MB)   After(MB)   Freed(MB) Freed%
-----------------------------------------------------------------------------------
-SYS_LOB0000076469C00004$$                7,987.20    6,102.40    1,884.80  23.6%
-SYS_LOB0000076465C00004$$                4,218.88    3,450.11      768.77  18.2%
-PAYMENT_ADDITIONAL_INFO                  3,778.56    2,100.22    1,678.34  44.4%
-DIRECTORY_DISPATCHING                    2,631.68    1,800.50      831.18  31.6%
-PAY_ADD_PAY_KEY_INDX                     2,314.24    1,500.00      814.24  35.2%
-PAYMENT                                  2,109.44    1,200.33      909.11  43.1%
-PAYMENT_AUDIT                            1,474.56      820.10      654.46  44.4%
-...
-----------------------------------------------------------------------------------
-TOTAL (OPPAYMENTS)                      34,910.27   24,150.80   10,759.47  30.8%
-============================================================
-NOTE: Segment sizes reflect allocated space, not actual data.
-Space freed by DELETE is reusable by Oracle but does not
-reduce OS disk usage. Use --reclaim or SHRINK SPACE to
-compact segments, then RESIZE datafiles to free OS disk.
-For full disk reclamation, use the tablespace reclaim tool.
-============================================================
-```
-
-All purge output (including DBMS_OUTPUT from the PL/SQL package) streams live to the console in real time, so you can monitor progress without querying the database separately.
-
-The space comparison is automatic — it snapshots all OPPAYMENTS segments (tables, indexes, and **LOB segments resolved to their parent table**) before and after purge. LOB segments like `SYS_LOB...` are mapped back to their parent table name via `dba_lobs`, so you can see the full picture including LOB storage impact.
-
-The snapshot data is also stored in `oppayments.epf_purge_space_snapshot` for querying:
-
-```sql
--- Compare before/after for a specific run
-SELECT b.parent_table,
-       b.total_mb AS before_mb,
-       a.total_mb AS after_mb,
-       b.total_mb - a.total_mb AS freed_mb
-FROM (
-    SELECT parent_table, SUM(size_mb) AS total_mb
-    FROM oppayments.epf_purge_space_snapshot
-    WHERE run_id = HEXTORAW('your_run_id') AND snapshot_phase = 'BEFORE'
-    GROUP BY parent_table
-) b
-LEFT JOIN (
-    SELECT parent_table, SUM(size_mb) AS total_mb
-    FROM oppayments.epf_purge_space_snapshot
-    WHERE run_id = HEXTORAW('your_run_id') AND snapshot_phase = 'AFTER'
-    GROUP BY parent_table
-) a ON b.parent_table = a.parent_table
-ORDER BY freed_mb DESC NULLS LAST;
-```
-
-## Configuration File
-
-For automated/scheduled runs, copy the example config:
-
-```bash
-cp config/epf_purge.conf.example config/epf_purge.conf
-# Edit config/epf_purge.conf with your settings
-```
-
-Then run with:
-```bash
-./bin/epf_purge.sh --config config/epf_purge.conf
-```
-
-Set the password via environment variable (never store passwords in config files):
-```bash
-export EPF_PURGE_PASSWORD='your_password'
-```
-
-See [config/epf_purge.conf.example](config/epf_purge.conf.example) for all available settings.
-
-## Space Reclamation
-
-### Lightweight Reclamation (--reclaim flag)
-
-After purging, Oracle marks freed space as reusable but does **not** shrink the datafiles. The `--reclaim` flag handles this automatically by running all three tiers in sequence:
-
-1. **SHRINK SPACE CASCADE** — Compacts data within each table segment (including LOBs and indexes). Online, no downtime.
-2. **COALESCE** — Merges adjacent free extents in the tablespace.
-3. **RESIZE datafiles** — Actually shrinks the `.dbf` files on disk, returning space to the OS. **Requires DBA privileges** — if the user doesn't have them, this step is skipped gracefully with a warning (Tiers 1-2 still complete).
-
-```bash
-# Purge + lightweight space reclamation
-./bin/epf_purge.sh --tns SONEPAR_ANM --user oppayments --retention 90 --reclaim
-```
-
-### Full Tablespace Reclaim (Recommended for Disk Pressure)
-
-When lightweight reclamation is insufficient, the **tablespace reclaim tool** performs a full export/drop/recreate/import cycle. This guarantees full disk space recovery and restructures the tablespace with modern settings (BIGFILE, AUTOEXTEND, ASSM).
-
-This is a **standalone tool** -- it does not require running the purge first. You can use it independently whenever you need to reclaim disk space, even without deleting any data.
-
-**What it does:**
-1. Discovers the tablespace used by OPPAYMENTS (typically DATA)
-2. Finds **all schemas** sharing that tablespace
-3. Detects PDB/non-PDB environment and whether the tablespace is the database default
-4. Detects the Data Pump directory (PDB_DATA_PUMP_DIR or DATA_PUMP_DIR)
-5. Exports all schemas via `expdp`
-6. Creates a temporary **holding tablespace** for safe user reassignment
-7. Switches the database/PDB default tablespace to the holding TS (if applicable)
-8. Reassigns all users to the holding tablespace
-9. Drops the original tablespace (`INCLUDING CONTENTS AND DATAFILES`)
-10. Recreates it as a `BIGFILE` tablespace with `AUTOEXTEND ON`
-11. Restores the database/PDB default and reassigns all users back
-12. Imports all schemas via `impdp`
-13. Verifies all objects, recompiles invalid ones, drops the holding tablespace
-
-```bash
-# Linux
-./bin/epf_tablespace_reclaim.sh --tns EPFPROD --sys-password MyPassword
-
-# Windows
-bin\epf_tablespace_reclaim.bat --tns EPFPROD --sys-password MyPassword
-
-# Or run interactively (prompts for everything)
-./bin/epf_tablespace_reclaim.sh
-```
-
-**Requirements:**
-- Application **downtime** required
-- SYS or DBA-privileged credentials
-- `expdp` / `impdp` on PATH
-- Sufficient disk space for the dump file
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--tns NAME` | *(required)* | Oracle TNS name or connect string |
-| `--dba-user NAME` | `sys` | DBA username |
-| `--dba-password PASS` | *(prompted)* | DBA password (prefer `EPF_DBA_PASSWORD` env var) |
-| `--sys-password PASS` | — | Shortcut: sets `--dba-user=sys` + password |
-| `--oppayments-user NAME` | `oppayments` | OPPAYMENTS schema name |
-| `--datafile-path PATH` | *(auto-detected)* | Path for the new datafile |
-| `--datafile-size SIZE` | `10G` | Initial datafile size |
-| `--autoextend-next SIZE` | `1G` | Autoextend increment |
-| `--autoextend-max SIZE` | `UNLIMITED` | Maximum datafile size |
-
-See [docs/space_reclamation_guide.md](docs/space_reclamation_guide.md) for detailed background on how Oracle manages space.
-
-## Project Structure
-
-```
-EPF_DATA_PURGE/
-├── README.md                              # This file
-├── .gitignore
-├── sql/
-│   ├── 01_create_purge_log_table.sql      # Audit log table DDL
-│   ├── 02_epf_purge_pkg_spec.sql          # PL/SQL package specification
-│   ├── 03_epf_purge_pkg_body.sql          # PL/SQL package body (all purge logic)
-│   ├── 04_drop_epf_purge_pkg.sql          # Package cleanup script
-│   └── legacy/                            # Original French scripts (reference only)
-├── bin/
-│   ├── epf_purge.sh                       # Linux/Unix purge wrapper script
-│   ├── epf_purge.bat                      # Windows purge wrapper script
-│   ├── epf_tablespace_reclaim.sh          # Linux/Unix tablespace reclaim script
-│   └── epf_tablespace_reclaim.bat         # Windows tablespace reclaim script
-├── config/
-│   └── epf_purge.conf.example             # Example configuration file
-├── logs/                                  # Runtime log files (gitignored)
-└── docs/
-    └── space_reclamation_guide.md         # Tablespace management guide
-```
+---
 
 ## Troubleshooting
 
-### ORA-01555: snapshot too old
-Reduce `--batch-size` (e.g., 500 or 100). This error occurs when the undo tablespace is too small for the batch.
+| Problem | Solution |
+|---------|----------|
+| **"SQL*Plus not found"** | Install Oracle Client (Instant Client is enough) and add `sqlplus` to your PATH. |
+| **Connection failed** | Check TNS name (`tnsping EPFPROD`), credentials, and `tnsnames.ora`. |
+| **ORA-30036 (undo full)** | Reduce `--batch-size` to 500 or smaller. Or ask DBA to extend the UNDO tablespace. |
+| **Disk space not freed** | Expected — use `--reclaim` to actually shrink the datafiles. See section below. |
+| **Purge seems stuck** | Check progress: `SELECT module, action, client_info FROM v$session WHERE module = 'EPF_PURGE';` |
+| **Package compilation error** | Check: `SELECT line, text FROM user_errors WHERE name = 'EPF_PURGE_PKG';` — usually a missing privilege. |
 
-### ORA-10631: SHRINK SPACE on non-ASSM tablespace
-Your tablespace uses Manual Segment Space Management. SHRINK SPACE only works with ASSM. Check with:
-```sql
-SELECT tablespace_name, segment_space_management
-FROM dba_tablespaces WHERE tablespace_name LIKE 'OPPAYMENTS%';
+---
+
+## How Space Reclamation Works (`--reclaim`)
+
+### The Problem: Why Deleting Data Doesn't Free Disk Space
+
+When you `DELETE` rows in Oracle, the data is removed from the table — but **the file on disk stays the same size**. This surprises everyone the first time.
+
+Think of it like a book where you erase text from pages. The pages are now blank, but the book doesn't get thinner. Oracle marks those blank pages as "reusable" — new data can be written there — but the physical `.dbf` datafile doesn't shrink.
+
+This is because of the **High Water Mark (HWM)** — an internal marker that tracks the *highest block ever used* in the tablespace. Oracle can only resize its datafile down to the HWM. If a single table (or index, or LOB segment) is still using a block near the top, the entire datafile stays that size.
+
+```
+BEFORE PURGE — 40 GB datafile, data scattered throughout:
+
+    Block 0          ███░░███░░███████░░░██████░░░░████████      Block 40GB
+                     ↑ data      ↑ gap     ↑ data    ↑ HWM (40GB)
+
+AFTER PURGE — Many rows deleted, but HWM unchanged:
+
+    Block 0          ██░░░░░░░░░██░░░░░░░░░░░░░░░░░░░░░████      Block 40GB
+                     ↑ data     ↑ gap (lots of free space)  ↑ HWM still 40GB!
+                                                               (one segment pinning it)
 ```
 
-### Package compilation errors
-Check `USER_ERRORS`:
-```sql
-SELECT line, text FROM user_errors WHERE name = 'EPF_PURGE_PKG' ORDER BY sequence;
-```
+The datafile can't shrink because that small segment at the top (block 40GB) is still there. The `--reclaim` option fixes this.
 
-### Connection issues
-- Verify TNS name: `tnsping EPFPROD`
-- Check listener: `lsnrctl status`
-- Test manually: `sqlplus oppayments/password@EPFPROD`
+### The Solution: 3-Phase Reclaim
 
-### Slow purge performance
-- Increase `--batch-size` (try 5000 or 10000)
-- Ensure indexes exist on foreign key columns
-- Run during off-peak hours
-- Check for locks: `SELECT * FROM v$lock WHERE type = 'TX';`
+#### Phase 1 — SHRINK SPACE (compact each table)
 
-## Direct PL/SQL Usage
-
-If you prefer to manage the package manually without the wrapper scripts:
+For every table in the tablespace, Oracle compacts the rows into fewer blocks and releases unused blocks:
 
 ```sql
--- Deploy (run these in order via sqlplus)
-@sql/01_create_purge_log_table.sql
-@sql/02_epf_purge_pkg_spec.sql
-@sql/03_epf_purge_pkg_body.sql
-
--- Execute
-SET SERVEROUTPUT ON SIZE UNLIMITED
-BEGIN
-    oppayments.epf_purge_pkg.run_purge(
-        p_retention_days => 90,
-        p_purge_depth    => 'ALL',
-        p_batch_size     => 1000,
-        p_reclaim_space  => FALSE,
-        p_dry_run        => FALSE
-    );
-END;
-/
-
--- Or run individual modules
-DECLARE
-    l_run_id RAW(16) := SYS_GUID();
-BEGIN
-    oppayments.epf_purge_pkg.purge_bulk_payments(
-        p_run_id      => l_run_id,
-        p_cutoff_date => TRUNC(SYSDATE - 90),
-        p_batch_size  => 1000,
-        p_dry_run     => FALSE
-    );
-    oppayments.epf_purge_pkg.print_run_summary(l_run_id);
-END;
-/
-
--- Cleanup
-@sql/04_drop_epf_purge_pkg.sql
+-- For each table:
+ALTER TABLE oppayments.payment ENABLE ROW MOVEMENT;     -- required for shrink
+ALTER TABLE oppayments.payment SHRINK SPACE CASCADE;     -- compact table + indexes + LOB segments
 ```
+
+`CASCADE` means it also shrinks the table's indexes and LOB segments (CLOBs).
+
+**Result:** Each table uses fewer blocks. "Used space" drops significantly. But the HWM doesn't necessarily drop — the data just got compacted within its existing blocks, and the top segment may still be pinning the HWM.
+
+```
+AFTER PHASE 1 — Data compacted, but HWM still pinned:
+
+    Block 0          ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░████      Block 40GB
+                     ↑ data (compacted)          still pinned ↑ HWM
+```
+
+#### Phase 2 — SQUEEZE (lower the HWM by relocating segments)
+
+This is the clever part. The script runs a loop (up to 2,000 iterations):
+
+1. **Find** whichever segment (table, index, or LOB) has extents closest to the top of the tablespace — this is the one "pinning" the HWM.
+2. **Squeeze the ceiling** — resize the datafile down to just above the HWM, so Oracle can't place new extents at the top.
+3. **Move/Rebuild** that segment so Oracle allocates it lower in the tablespace:
+   - Tables: `ALTER TABLE ... MOVE ONLINE TABLESPACE ...`
+   - Indexes: `ALTER INDEX ... REBUILD ONLINE`
+   - LOB segments: `ALTER TABLE ... MOVE LOB (column) STORE AS (TABLESPACE ...)`
+4. **Check** if the HWM dropped. If so, the segment successfully moved lower.
+5. **Repeat** with the next top segment.
+
+**A single iteration looks like this (example):**
+
+```sql
+-- The PAYMENT_AUDIT index is the top segment at 39.8 GB
+-- Squeeze datafile ceiling to just above HWM:
+ALTER DATABASE DATAFILE '/path/data01.dbf' RESIZE 40960M;   -- tight ceiling
+
+-- Rebuild the index — Oracle places it in the lower free space:
+ALTER INDEX oppayments.PAY_AUDIT_IDX REBUILD ONLINE;
+
+-- HWM drops from 39.8 GB to 38.2 GB (next segment)
+-- Next iteration: handle whatever is now at the top (38.2 GB)
+```
+
+After many iterations, all segments are packed toward the bottom and the HWM is close to the actual used space:
+
+```
+AFTER PHASE 2 — All segments relocated down:
+
+    Block 0          ████████████████░░░░░░░░░░░░░░░░░░░░░░      Block 40GB
+                     ↑ everything packed   ↑ HWM now ~15GB     (wasted space)
+```
+
+#### Phase 3 — RESIZE (shrink the file on disk)
+
+With the HWM lowered, Oracle can finally shrink the datafile:
+
+```sql
+-- HWM is at ~15 GB. Resize to HWM + 50 MB safety margin:
+ALTER DATABASE DATAFILE '/path/data01.dbf' RESIZE 15410M;
+-- Datafile shrinks from 40 GB to ~15 GB on disk. OS space freed!
+```
+
+```
+AFTER PHASE 3 — Datafile actually shrunk:
+
+    Block 0          ████████████████|     (end of file)
+                     ↑ data          ↑ HWM (15 GB) = file size
+                     
+                     Freed: 25 GB returned to OS ✓
+```
+
+#### Phase 4 — UNDO/TEMP cleanup
+
+Finally, the script tries to shrink the UNDO and TEMP tablespaces too, which may have bloated during the purge. If a simple `RESIZE` fails (scattered extents), it does a full tablespace swap: creates a new UNDO tablespace → switches Oracle to use it → drops the old one.
+
+### Key Points
+
+| Aspect | Detail |
+|--------|--------|
+| **Online?** | Yes — all operations use `MOVE ONLINE` / `REBUILD ONLINE`. Row-level locks only. Application stays running. |
+| **Duration** | Depends on tablespace size and fragmentation. Typically 30 minutes to several hours. |
+| **Stall detection** | Every 100 iterations, the script checks if the HWM actually dropped. If it stalls 3 times in a row, it exits gracefully (some segments can't be moved). |
+| **LOB handling** | CLOB/LOB segments are detected and moved explicitly via `ALTER TABLE ... MOVE LOB (column)`. |
+| **Safety** | If any individual MOVE fails, the script logs the error and continues with the next segment. No data is lost. |

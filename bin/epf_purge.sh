@@ -36,10 +36,14 @@ BATCH_SIZE=1000
 DRY_RUN="N"
 RECLAIM_SPACE="N"
 RECLAIM_ONLY="N"
+SKIP_STALL_CHECKS="N"
+OPTIMIZE_DB="N"
 SYS_PASSWORD=""
 ASSUME_YES="N"
 DROP_PACKAGE_AFTER="N"
 DROP_LOGS="N"
+TRUNCATE_LOGS="N"
+SHOW_SIZES="N"
 CONFIG_FILE=""
 
 # ============================================================================
@@ -75,10 +79,16 @@ parse_args() {
             --dry-run)      DRY_RUN="Y"; shift ;;
             --reclaim)      RECLAIM_SPACE="Y"; shift ;;
             --reclaim-only) RECLAIM_ONLY="Y"; RECLAIM_SPACE="Y"; shift ;;
+            --reclaim-online)      RECLAIM_SPACE="Y"; shift ;;  # legacy alias
+            --reclaim-online-only) RECLAIM_ONLY="Y"; RECLAIM_SPACE="Y"; shift ;;  # legacy alias
+            --no-stall-check) SKIP_STALL_CHECKS="Y"; shift ;;
+            --optimize-db)  OPTIMIZE_DB="Y"; shift ;;
             --sys-password) SYS_PASSWORD="$2"; shift 2 ;;
             --assume-yes|-y) ASSUME_YES="Y"; shift ;;
             --drop-pkg)     DROP_PACKAGE_AFTER="Y"; shift ;;
             --drop-logs)    DROP_LOGS="Y"; shift ;;
+            --truncate-logs) TRUNCATE_LOGS="Y"; shift ;;
+            --show-sizes)   SHOW_SIZES="Y"; shift ;;
             --help|-h)      show_help; exit 0 ;;
             *)              log_error "Unknown argument: $1"; show_help; exit 1 ;;
         esac
@@ -110,6 +120,7 @@ load_config() {
                 BATCH_SIZE)         BATCH_SIZE="$value" ;;
                 DRY_RUN)            DRY_RUN="$value" ;;
                 RECLAIM_SPACE)      RECLAIM_SPACE="$value" ;;
+                SKIP_STALL_CHECKS)  SKIP_STALL_CHECKS="$value" ;;
                 DROP_PACKAGE_AFTER) DROP_PACKAGE_AFTER="$value" ;;
             esac
         done < "$CONFIG_FILE"
@@ -141,11 +152,16 @@ Options:
   --depth DEPTH     Purge scope: ALL, PAYMENTS, LOGS, BANK_STATEMENTS (default: ALL)
   --batch-size N    Rows per batch commit (default: 1000)
   --dry-run         Count rows only, do not delete anything
-  --reclaim         After purge, invoke epf_tablespace_reclaim.sh
-                    (export/import/recreate-as-BIGFILE; needs DBA creds)
-  --reclaim-only    Skip purge entirely, run reclaim tool only
+  --optimize-db     Run DB optimization before purge (enlarge redo logs, gather stats)
+                    Needs DBA/SYS creds. ~4 GB temp disk space. Idempotent.
+  --reclaim         After purge, run online space reclaim (SHRINK + squeeze + resize)
+                    No downtime required. Needs DBA/SYS creds.
+  --reclaim-only    Skip purge entirely, run online reclaim only
+  --no-stall-check  Disable stall detection during reclaim (always run all iterations)
   --drop-pkg        Drop the PL/SQL package after execution
   --drop-logs       Drop purge log tables (epf_purge_log, epf_purge_space_snapshot)
+  --truncate-logs   Clear all purge run history before starting (keeps tables)
+  --show-sizes      Show data sizes per module to help choose purge depth
   --help, -h        Show this help message
 
 Environment Variables:
@@ -162,7 +178,10 @@ Examples:
   ./epf_purge.sh --config ../config/epf_purge.conf
 
   # Purge only payment data with space reclamation
-  ./epf_purge.sh --tns EPFPROD --user oppayments --depth PAYMENTS --reclaim
+  ./epf_purge.sh --tns EPFPROD --user oppayments --depth PAYMENTS --reclaim --sys-password XXX
+
+  # Reclaim only (after a previous purge)
+  ./epf_purge.sh --tns EPFPROD --reclaim-only --sys-password XXX
 HELPEOF
 }
 
@@ -196,6 +215,19 @@ interactive_prompts() {
     RETENTION_DAYS="${input:-$RETENTION_DAYS}"
 
     echo ""
+    echo "  Show Module Data Sizes (--show-sizes)"
+    echo "  Queries the database to show data sizes per purge module"
+    echo "  to help you choose the appropriate purge depth."
+    read -rp "  Show data sizes? (Y/N) [$SHOW_SIZES]: " input
+    SHOW_SIZES="${input:-$SHOW_SIZES}"
+
+    if [[ "${SHOW_SIZES^^}" == "Y" ]]; then
+        echo ""
+        echo "  [INFO]  Querying data sizes..."
+        sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" @"${SQL_DIR}/11_show_module_sizes.sql" 2>/dev/null
+    fi
+
+    echo ""
     echo "  Purge Depth"
     echo "  Controls which data modules are purged:"
     echo "    ALL             - Purge all modules (payments, logs, bank statements)"
@@ -220,29 +252,54 @@ interactive_prompts() {
     DRY_RUN="${input:-$DRY_RUN}"
 
     echo ""
-    echo "  Space Reclamation"
-    echo "  After purging, attempt to reclaim space within Oracle tablespaces"
-    echo "  using SHRINK SPACE. This makes space reusable by Oracle but does"
-    echo "  NOT reduce the OS-level file size."
-    read -rp "  Reclaim space? (Y/N) [$RECLAIM_SPACE]: " input
-    RECLAIM_SPACE="${input:-$RECLAIM_SPACE}"
-
-    # Collect SYS password upfront so the reclaim step runs unattended.
-    if [[ "${RECLAIM_SPACE^^}" == "Y" && -z "$SYS_PASSWORD" ]]; then
-        echo ""
-        echo "  Reclaim requires DBA/SYS credentials to drop and recreate"
-        echo "  the tablespace. Enter the SYS password now so the reclaim"
-        echo "  step runs unattended after the purge."
-        read -rsp "  SYS password: " SYS_PASSWORD
-        echo ""
-    fi
-
-    echo ""
     echo "  Drop Package After Execution"
     echo "  If yes, the PL/SQL package will be removed from the database"
     echo "  after the purge completes. The log table is preserved."
     read -rp "  Drop package after? (Y/N) [$DROP_PACKAGE_AFTER]: " input
     DROP_PACKAGE_AFTER="${input:-$DROP_PACKAGE_AFTER}"
+
+    echo ""
+    echo "  Truncate Purge Logs (--truncate-logs)"
+    echo "  Clears all previous purge run history from the log tables."
+    echo "  Useful when re-running after a failed or test purge."
+    read -rp "  Truncate logs? (Y/N) [$TRUNCATE_LOGS]: " input
+    TRUNCATE_LOGS="${input:-$TRUNCATE_LOGS}"
+
+    echo ""
+    echo "  Pre-Purge Database Optimization (--optimize-db)"
+    echo "  Enlarges redo logs to 1 GB and gathers optimizer statistics."
+    echo "  Recommended for first-time purge on databases with small redo logs."
+    echo "  Requires SYS/DBA credentials. Idempotent and auto-reverts on failure."
+    echo "  >> Extra disk space: ~4 GB temporary (new redo logs before old ones deleted)"
+    read -rp "  Optimize DB? (Y/N) [$OPTIMIZE_DB]: " input
+    OPTIMIZE_DB="${input:-$OPTIMIZE_DB}"
+
+    echo ""
+    echo "  Post-Purge Space Reclaim (--reclaim)"
+    echo "  After purge, shrinks and squeezes the tablespace to free OS disk space."
+    echo "  Online operation (no downtime). Requires SYS/DBA credentials."
+    echo "  >> No extra disk space needed (MOVE uses existing free space in tablespace)"
+    read -rp "  Reclaim space? (Y/N) [$RECLAIM_SPACE]: " input
+    RECLAIM_SPACE="${input:-$RECLAIM_SPACE}"
+
+    if [[ "${RECLAIM_SPACE^^}" == "Y" ]]; then
+        echo ""
+        echo "  Skip Stall Checks (--no-stall-check)"
+        echo "  When enabled, reclaim always runs all 2000 iterations without"
+        echo "  stopping early on zero-progress checkpoints."
+        read -rp "  Skip stall checks? (Y/N) [$SKIP_STALL_CHECKS]: " input
+        SKIP_STALL_CHECKS="${input:-$SKIP_STALL_CHECKS}"
+    fi
+
+    # Prompt for SYS password now if optimize-db or reclaim enabled
+    if [[ "${OPTIMIZE_DB^^}" == "Y" || "${RECLAIM_SPACE^^}" == "Y" ]]; then
+        if [[ -z "$SYS_PASSWORD" ]]; then
+            echo ""
+            echo "  SYS/DBA password (needed for optimize-db and/or reclaim)"
+            read -rsp "  SYS password: " SYS_PASSWORD
+            echo ""
+        fi
+    fi
 }
 
 # ============================================================================
@@ -317,6 +374,21 @@ SQLEOF
 }
 
 # ============================================================================
+# Truncate purge log tables (clear old run history)
+# ============================================================================
+truncate_logs() {
+    [[ "${TRUNCATE_LOGS^^}" != "Y" ]] && return
+
+    log_info "Truncating purge log tables..."
+    sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'SQLEOF' >/dev/null 2>&1
+TRUNCATE TABLE oppayments.epf_purge_log;
+TRUNCATE TABLE oppayments.epf_purge_space_snapshot;
+EXIT;
+SQLEOF
+    log_ok "Purge logs truncated"
+}
+
+# ============================================================================
 # Deploy PL/SQL package
 # ============================================================================
 deploy_package() {
@@ -372,6 +444,289 @@ SQLEOF
 }
 
 # ============================================================================
+# Grant DBA view access for space snapshots (needs SYS)
+# ============================================================================
+# The space comparison needs dba_segments to match reclaim report numbers.
+# Grants are idempotent and only run when SYS password is available.
+grant_dba_views() {
+    [[ -z "$SYS_PASSWORD" ]] && return
+
+    log_info "Granting DBA view access to ${USERNAME} for space snapshots..."
+    sqlplus -S "sys/${SYS_PASSWORD}@${TNS_NAME} AS SYSDBA" <<SQLEOF >> "$LOG_FILE" 2>&1
+SET HEADING OFF FEEDBACK OFF
+GRANT SELECT ON sys.dba_segments TO ${USERNAME};
+GRANT SELECT ON sys.dba_lobs TO ${USERNAME};
+EXIT;
+SQLEOF
+    log_ok "DBA view grants applied"
+}
+
+# ============================================================================
+# Start background progress monitor
+# ============================================================================
+# Launches a background loop that polls epf_purge_log via separate SQL*Plus
+# calls every 10s. Each poll is a fresh invocation so output is NEVER buffered
+# (unlike DBMS_OUTPUT which only flushes at block end).
+MONITOR_PID=""
+start_monitor() {
+    # Verify sqlplus is available (should be, since check_prerequisites passed)
+    if ! command -v sqlplus &>/dev/null; then
+        log_warn "Monitor: sqlplus not found on PATH. Skipping live monitor."
+        log_warn "Purge will continue without live progress. Check epf_purge_log table manually."
+        return 0
+    fi
+
+    log_info "Starting live progress monitor (polls epf_purge_log every 10s)"
+
+    (
+        local last_log_id=0
+        local run_id=""
+        local found_run=0
+        local poll_sec=10
+        local max_idle_sec=$((360 * 60))
+        local idle_start
+        idle_start=$(date +%s)
+
+        echo "[MONITOR] Started at $(date '+%Y-%m-%d %H:%M:%S')" | tee -a "$LOG_FILE"
+
+        while true; do
+            # Discover latest run_id
+            if [[ $found_run -eq 0 ]]; then
+                run_id=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'ENDSQL' 2>/dev/null | tr -d '[:space:]'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300 TRIMOUT ON TRIMSPOOL ON
+SELECT RAWTOHEX(run_id) FROM (
+    SELECT run_id FROM oppayments.epf_purge_log
+    WHERE operation = 'RUN_START'
+    ORDER BY log_timestamp DESC
+) WHERE ROWNUM = 1;
+EXIT;
+ENDSQL
+                )
+                if [[ -n "$run_id" && ${#run_id} -ge 16 ]]; then
+                    found_run=1
+                    idle_start=$(date +%s)
+                    echo "[MONITOR] Tracking run_id: $run_id" | tee -a "$LOG_FILE"
+                fi
+            fi
+
+            # Fetch new entries
+            if [[ $found_run -eq 1 ]]; then
+                local output
+                output=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<ENDSQL 2>/dev/null
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500 TRIMOUT ON TRIMSPOOL ON
+SELECT log_id || '|' ||
+       TO_CHAR(log_timestamp, 'HH24:MI:SS') || '|' ||
+       module || '|' ||
+       operation || '|' ||
+       NVL(TO_CHAR(batch_number), '') || '|' ||
+       NVL(TO_CHAR(rows_affected), '0') || '|' ||
+       status || '|' ||
+       NVL(REPLACE(message, '|', '/'), '') || '|' ||
+       NVL(TO_CHAR(ROUND(elapsed_seconds, 1)), '') || '|' ||
+       NVL(table_name, '')
+FROM oppayments.epf_purge_log
+WHERE run_id = HEXTORAW('${run_id}')
+  AND log_id > ${last_log_id}
+ORDER BY log_id;
+EXIT;
+ENDSQL
+                )
+
+                local any_new=0
+                while IFS='|' read -r log_id ts module operation batch_num rows_aff status message elapsed tbl_name; do
+                    # Skip empty lines
+                    log_id=$(echo "$log_id" | tr -d '[:space:]')
+                    [[ -z "$log_id" ]] && continue
+
+                    any_new=1
+                    last_log_id=$log_id
+                    idle_start=$(date +%s)
+
+                    ts=$(echo "$ts" | xargs)
+                    module=$(echo "$module" | xargs)
+                    operation=$(echo "$operation" | xargs)
+                    batch_num=$(echo "$batch_num" | xargs)
+                    status=$(echo "$status" | xargs)
+                    message=$(echo "$message" | xargs)
+                    elapsed=$(echo "$elapsed" | xargs)
+
+                    local line=""
+                    if [[ "$operation" == "RUN_START" ]]; then
+                        line="[$ts] ** PURGE STARTED ** $message"
+                    elif [[ "$operation" == "RUN_END" ]]; then
+                        line="[$ts] ** PURGE COMPLETED ** $message (total: ${elapsed}s)"
+                        echo "$line" | tee -a "$LOG_FILE"
+                        exit 0
+                    elif [[ "$operation" == "DELETE" && -n "$batch_num" ]]; then
+                        line="[$ts] $(printf '%-12s' "$module") batch $(printf '%5s' "$batch_num")  $message  (${elapsed}s)"
+                    elif [[ "$status" == "ERROR" ]]; then
+                        line="[$ts] *** ERROR *** $module - $message"
+                        echo "$line" | tee -a "$LOG_FILE"
+                        exit 1
+                    elif [[ "$operation" =~ DRY_RUN_COUNT|INFO|INIT ]]; then
+                        line="[$ts] $(printf '%-12s' "$module") $message"
+                    elif [[ -n "$message" ]]; then
+                        line="[$ts] $(printf '%-12s' "$module") $message"
+                    fi
+
+                    [[ -n "$line" ]] && echo "$line" | tee -a "$LOG_FILE"
+                done <<< "$output"
+
+                # If no new activity, check for a newer run_id (handles cancelled/restarted runs)
+                if [[ $any_new -eq 0 && $last_log_id -gt 0 ]]; then
+                    local latest_id
+                    latest_id=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'ENDSQL' 2>/dev/null | tr -d '[:space:]'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300 TRIMOUT ON TRIMSPOOL ON
+SELECT RAWTOHEX(run_id) FROM (
+    SELECT run_id FROM oppayments.epf_purge_log
+    WHERE operation = 'RUN_START'
+    ORDER BY log_timestamp DESC
+) WHERE ROWNUM = 1;
+EXIT;
+ENDSQL
+                    )
+                    if [[ -n "$latest_id" && ${#latest_id} -ge 16 && "$latest_id" != "$run_id" ]]; then
+                        echo "" | tee -a "$LOG_FILE"
+                        echo "[MONITOR] Newer run detected: $latest_id (was $run_id)" | tee -a "$LOG_FILE"
+                        echo "[MONITOR] Switching to new run_id..." | tee -a "$LOG_FILE"
+                        echo "" | tee -a "$LOG_FILE"
+                        run_id="$latest_id"
+                        last_log_id=0
+                        idle_start=$(date +%s)
+                    fi
+                fi
+            fi
+
+            # Check timeout
+            local now
+            now=$(date +%s)
+            local idle=$(( now - idle_start ))
+            if [[ $idle -gt $max_idle_sec ]]; then
+                echo "[MONITOR] Timeout after $((idle / 60)) min of inactivity." | tee -a "$LOG_FILE"
+                exit 0
+            fi
+
+            sleep "$poll_sec"
+        done
+    ) &
+    MONITOR_PID=$!
+    # Give the monitor a moment to connect
+    sleep 2
+
+    # Verify the background process is actually running
+    if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
+        log_warn "Monitor process (PID $MONITOR_PID) exited immediately."
+        log_warn "Possible causes: DB connection issue, epf_purge_log table missing, or sqlplus error."
+        log_warn "Purge will continue without live progress. Check epf_purge_log table manually:"
+        log_warn "  SELECT message FROM oppayments.epf_purge_log ORDER BY log_id DESC FETCH FIRST 5 ROWS ONLY;"
+        MONITOR_PID=""
+    else
+        log_ok "Monitor started (PID $MONITOR_PID)"
+    fi
+}
+
+stop_monitor() {
+    # Safe to call even if monitor was never started
+    if [[ -z "$MONITOR_PID" ]]; then
+        return 0
+    fi
+    if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
+        # Already exited on its own (normal - saw RUN_END)
+        wait "$MONITOR_PID" 2>/dev/null || true
+        MONITOR_PID=""
+        return 0
+    fi
+    # Give the monitor up to 60s to see RUN_END and exit gracefully
+    log_info "Waiting for monitor to detect completion..."
+    local waited=0
+    while kill -0 "$MONITOR_PID" 2>/dev/null && [[ $waited -lt 60 ]]; do
+        sleep 2
+        waited=$((waited + 2))
+    done
+    # If still running, terminate
+    if kill -0 "$MONITOR_PID" 2>/dev/null; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+    fi
+    MONITOR_PID=""
+}
+
+# ============================================================================
+# Pre-purge: Tune UNDO to prevent excessive tablespace growth
+# ============================================================================
+# Bulk deletes generate large amounts of undo data. By default Oracle keeps
+# expired undo for undo_retention seconds (typically 900s = 15 min).
+# During a multi-hour purge this causes the undo tablespace to grow unbounded.
+# We lower undo_retention to 60s and cap the datafile autoextend max to limit
+# growth.  The original values are restored after the purge.
+tune_undo_pre_purge() {
+    [[ -z "$SYS_PASSWORD" ]] && return
+    [[ "${DRY_RUN^^}" == "Y" ]] && return
+
+    log_info "Tuning UNDO for bulk delete (retention=60s, maxsize=8G)"
+
+    local sys_connect
+    if [[ "${SYS_USER:-sys}" == "sys" ]]; then
+        sys_connect="sys/${SYS_PASSWORD}@${TNS_NAME} AS SYSDBA"
+    else
+        sys_connect="${SYS_USER}/${SYS_PASSWORD}@${TNS_NAME}"
+    fi
+
+    sqlplus -S "${sys_connect}" <<'SQLEOF' 2>&1 | tee -a "$LOG_FILE"
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
+DECLARE
+    v_ret NUMBER;
+BEGIN
+    SELECT value INTO v_ret FROM v$parameter WHERE name = 'undo_retention';
+    DBMS_OUTPUT.PUT_LINE('UNDO_RETENTION_ORIGINAL=' || v_ret);
+    IF v_ret > 60 THEN
+        EXECUTE IMMEDIATE 'ALTER SYSTEM SET undo_retention = 60';
+        DBMS_OUTPUT.PUT_LINE('Lowered undo_retention from ' || v_ret || 's to 60s');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('undo_retention already low: ' || v_ret || 's');
+    END IF;
+    FOR f IN (SELECT file_name, maxbytes
+              FROM dba_data_files
+              WHERE tablespace_name = (SELECT value FROM v$parameter WHERE name = 'undo_tablespace')
+                AND (autoextensible = 'YES' AND (maxbytes = 0 OR maxbytes > 8589934592)))
+    LOOP
+        BEGIN
+            EXECUTE IMMEDIATE 'ALTER DATABASE DATAFILE ''' || f.file_name || ''' AUTOEXTEND ON MAXSIZE 8G';
+            DBMS_OUTPUT.PUT_LINE('Capped autoextend: ' || f.file_name || ' maxsize=8G');
+        EXCEPTION WHEN OTHERS THEN
+            DBMS_OUTPUT.PUT_LINE('Could not cap ' || f.file_name || ': ' || SQLERRM);
+        END;
+    END LOOP;
+END;
+/
+EXIT;
+SQLEOF
+}
+
+# ============================================================================
+# Post-purge: Restore undo_retention to Oracle default
+# ============================================================================
+restore_undo_post_purge() {
+    [[ -z "$SYS_PASSWORD" ]] && return
+    [[ "${DRY_RUN^^}" == "Y" ]] && return
+
+    log_info "Restoring undo_retention to 900s"
+
+    local sys_connect
+    if [[ "${SYS_USER:-sys}" == "sys" ]]; then
+        sys_connect="sys/${SYS_PASSWORD}@${TNS_NAME} AS SYSDBA"
+    else
+        sys_connect="${SYS_USER}/${SYS_PASSWORD}@${TNS_NAME}"
+    fi
+
+    sqlplus -S "${sys_connect}" <<'SQLEOF' >/dev/null 2>&1
+ALTER SYSTEM SET undo_retention = 900;
+EXIT;
+SQLEOF
+}
+
+# ============================================================================
 # Execute purge
 # ============================================================================
 execute_purge() {
@@ -388,6 +743,7 @@ execute_purge() {
     # (using tee pipe instead of variable capture so output appears in real time)
     sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<SQLEOF 2>&1 | tee -a "$LOG_FILE"
 SET SERVEROUTPUT ON SIZE UNLIMITED
+SET LINESIZE 200
 SET TIMING ON
 SET ECHO OFF FEEDBACK OFF
 
@@ -411,6 +767,41 @@ SQLEOF
     else
         log_ok "Purge execution completed"
     fi
+}
+
+# ============================================================================
+# Post-reclaim: Capture AFTER space snapshot and print comparison
+# ============================================================================
+# Space comparison is done here (after reclaim) instead of inside run_purge
+# because DELETE alone does not change segment sizes - only SHRINK/MOVE does.
+capture_space_comparison() {
+    [[ "${DRY_RUN^^}" == "Y" ]] && return
+
+    log_info "Capturing post-reclaim space snapshot and comparison..."
+
+    sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'SQLEOF' 2>&1 | tee -a "$LOG_FILE"
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET LINESIZE 200
+SET HEADING OFF FEEDBACK OFF
+DECLARE
+    l_run_id RAW(16);
+BEGIN
+    SELECT run_id INTO l_run_id FROM (
+        SELECT run_id FROM oppayments.epf_purge_log
+        WHERE operation = 'RUN_END'
+        ORDER BY log_timestamp DESC
+    ) WHERE ROWNUM = 1;
+    -- Delete stale AFTER snapshot (captured right after purge, before reclaim)
+    DELETE FROM oppayments.epf_purge_space_snapshot
+    WHERE run_id = l_run_id AND snapshot_phase = 'AFTER';
+    COMMIT;
+    -- Capture fresh AFTER snapshot (post-reclaim segment sizes)
+    oppayments.epf_purge_pkg.capture_space_snapshot(l_run_id, 'AFTER');
+    oppayments.epf_purge_pkg.print_space_comparison(l_run_id);
+END;
+/
+EXIT;
+SQLEOF
 }
 
 # ============================================================================
@@ -485,6 +876,36 @@ SQLEOF
 }
 
 # ============================================================================
+# Execute online tablespace reclaim (SHRINK + squeeze + resize)
+# ============================================================================
+execute_reclaim_online() {
+    log_header "Online Tablespace Reclaim"
+
+    log_info "Running: 05_reclaim_tablespace.sql (SHRINK + squeeze + resize)"
+    log_info "This requires DBA/SYS credentials for ALTER DATABASE and DBA views."
+
+    local sys_connect
+    if [[ "${SYS_USER:-sys}" == "sys" ]]; then
+        sys_connect="sys/${SYS_PASSWORD}@${TNS_NAME} AS SYSDBA"
+    else
+        sys_connect="${SYS_USER}/${SYS_PASSWORD}@${TNS_NAME}"
+    fi
+
+    sqlplus -S "${sys_connect}" <<SQLEOF 2>&1 | tee -a "$LOG_FILE"
+DEFINE skip_stall_checks = ${SKIP_STALL_CHECKS}
+@${SQL_DIR}/05_reclaim_tablespace.sql
+EXIT;
+SQLEOF
+    local sqlplus_exit=${PIPESTATUS[0]}
+
+    if [[ $sqlplus_exit -ne 0 ]]; then
+        log_warn "Online reclaim returned non-zero exit code."
+    else
+        log_ok "Online reclaim completed"
+    fi
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
@@ -504,19 +925,26 @@ main() {
         if [[ -z "$TNS_NAME" ]]; then
             echo ""
             echo "   ============================================================"
-            echo "   EPF Tablespace Reclaim (RECLAIM-ONLY MODE - no purge)"
+            echo "   EPF Space Reclaim (RECLAIM-ONLY MODE - no purge)"
             echo "   ============================================================"
             read -rp "  Enter TNS name: " TNS_NAME
         fi
-        log_info "Skipping purge. Delegating to epf_tablespace_reclaim.sh"
-        local -a reclaim_args=(--tns "$TNS_NAME")
-        [[ -n "$SYS_PASSWORD" ]] && reclaim_args+=(--sys-password "$SYS_PASSWORD")
-        [[ "${ASSUME_YES^^}" == "Y" ]] && reclaim_args+=(--assume-yes)
-        exec "${SCRIPT_DIR}/epf_tablespace_reclaim.sh" "${reclaim_args[@]}"
+        if [[ -z "$SYS_PASSWORD" ]]; then
+            read -rsp "  SYS password: " SYS_PASSWORD
+            echo ""
+        fi
+        log_info "Skipping purge. Running online reclaim only."
+        execute_reclaim_online
+        echo "" | tee -a "$LOG_FILE"
+        log_ok "Online reclaim completed. Log: $LOG_FILE"
+        echo "Finished: $(date)" >> "$LOG_FILE"
+        exit 0
     fi
 
     # If key params missing, go interactive
+    local _was_interactive="N"
     if [[ -z "$TNS_NAME" || -z "$PASSWORD" ]]; then
+        _was_interactive="Y"
         interactive_prompts
     fi
 
@@ -528,31 +956,115 @@ main() {
     log_info "Purge Depth:    $PURGE_DEPTH"
     log_info "Batch Size:     $BATCH_SIZE"
     log_info "Dry Run:        $DRY_RUN"
+    log_info "Optimize DB:    $OPTIMIZE_DB"
     log_info "Reclaim Space:  $RECLAIM_SPACE"
+    if [[ "${RECLAIM_SPACE^^}" == "Y" ]]; then
+        log_info "Skip Stall:     $SKIP_STALL_CHECKS"
+    fi
     log_info "Drop Package:   $DROP_PACKAGE_AFTER"
+    log_info "Truncate Logs:  $TRUNCATE_LOGS"
     log_info "Drop Logs:      $DROP_LOGS"
+
+    # Disk space estimate
+    echo "" | tee -a "$LOG_FILE"
+    log_info "--- Approximate Disk Space Requirements ---"
+    local est_total_gb=0
+    log_info "  Purge:        ~2-5 GB temporary (UNDO growth, auto-recovered after retention)"
+    est_total_gb=5
+    if [[ "${OPTIMIZE_DB^^}" == "Y" ]]; then
+        log_info "  Optimize DB:  ~4 GB temporary (4x1GB redo logs, old ones deleted after)"
+        est_total_gb=$((est_total_gb + 4))
+    fi
+    if [[ "${RECLAIM_SPACE^^}" == "Y" ]]; then
+        log_info "  Reclaim:      No extra space (uses existing free space in tablespace)"
+    fi
+    log_warn "  PEAK TOTAL:   ~${est_total_gb} GB of temporary free disk space required"
+    log_info "  The purge itself frees space; this is only the temporary overhead during execution."
 
     # Execute steps
     check_prerequisites
-    deploy_package
-    execute_purge
-    display_summary
 
-    # --reclaim delegates to the standalone tablespace reclaim tool
-    # (export/import/recreate-as-BIGFILE). DBA credentials are prompted there.
-    if [[ "${RECLAIM_SPACE^^}" == "Y" ]]; then
-        if [[ "${DRY_RUN^^}" == "Y" ]]; then
-            log_info "Skipping tablespace reclaim (dry run)"
+    # Show module sizes if requested (non-interactive only; interactive already handled in prompts)
+    if [[ "${SHOW_SIZES^^}" == "Y" && "$_was_interactive" != "Y" ]]; then
+        echo ""
+        log_info "Querying data sizes per module..."
+        sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" @"${SQL_DIR}/11_show_module_sizes.sql" 2>/dev/null
+    fi
+
+    # --optimize-db: enlarge redo logs + gather stats (needs SYS)
+    if [[ "${OPTIMIZE_DB^^}" == "Y" ]]; then
+        if [[ -z "$SYS_PASSWORD" ]]; then
+            echo ""
+            echo "  DB optimization requires DBA/SYS credentials."
+            read -rsp "  SYS password: " SYS_PASSWORD
+            echo ""
+        fi
+        log_header "Pre-Purge Database Optimization"
+        local sys_connect
+        if [[ "${SYS_USER:-sys}" == "sys" ]]; then
+            sys_connect="sys/${SYS_PASSWORD}@${TNS_NAME} AS SYSDBA"
         else
-            log_header "Invoking Tablespace Reclaim Tool"
-            log_info "--reclaim now delegates to epf_tablespace_reclaim.sh"
-            log_info "(export/import/recreate-as-BIGFILE). DBA credentials required."
-            "${SCRIPT_DIR}/epf_tablespace_reclaim.sh" --tns "${TNS_NAME}" \
-                --sys-password "${SYS_PASSWORD}" --assume-yes \
-                || log_warn "Tablespace reclaim did not complete successfully."
+            sys_connect="${SYS_USER}/${SYS_PASSWORD}@${TNS_NAME}"
+        fi
+        sqlplus -S "${sys_connect}" <<SQLEOF 2>&1 | tee -a "$LOG_FILE"
+@${SQL_DIR}/06_optimize_db.sql
+EXIT;
+SQLEOF
+        local opt_exit=${PIPESTATUS[0]}
+        if [[ $opt_exit -ne 0 ]]; then
+            log_warn "DB optimization returned non-zero exit code."
+        else
+            log_ok "DB optimization completed"
         fi
     fi
 
+    deploy_package
+    grant_dba_views
+    truncate_logs
+
+    # Create temporary FK indexes for purge performance (with --optimize-db)
+    if [[ "${OPTIMIZE_DB^^}" == "Y" && "${DRY_RUN^^}" != "Y" ]]; then
+        log_info "Creating temporary FK indexes for purge performance..."
+        sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'SQLEOF' >> "$LOG_FILE" 2>&1
+SET SERVEROUTPUT ON SIZE UNLIMITED
+@sql/06b_create_purge_indexes.sql
+SQLEOF
+        log_ok "Temporary FK indexes created"
+    fi
+
+    start_monitor
+    tune_undo_pre_purge
+    execute_purge
+    restore_undo_post_purge
+    display_summary
+
+    # Drop temporary FK indexes (before reclaim to avoid extra segments)
+    if [[ "${OPTIMIZE_DB^^}" == "Y" && "${DRY_RUN^^}" != "Y" ]]; then
+        log_info "Dropping temporary FK indexes..."
+        sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'SQLEOF' >> "$LOG_FILE" 2>&1
+SET SERVEROUTPUT ON SIZE UNLIMITED
+@sql/06c_drop_purge_indexes.sql
+SQLEOF
+        log_ok "Temporary FK indexes dropped"
+    fi
+
+    # --reclaim runs online space reclaim (SHRINK + squeeze + resize)
+    if [[ "${RECLAIM_SPACE^^}" == "Y" ]]; then
+        if [[ "${DRY_RUN^^}" == "Y" ]]; then
+            log_info "Skipping space reclaim (dry run)"
+        else
+            if [[ -z "$SYS_PASSWORD" ]]; then
+                echo ""
+                echo "  Space reclaim requires DBA/SYS credentials."
+                read -rsp "  SYS password: " SYS_PASSWORD
+                echo ""
+            fi
+            execute_reclaim_online
+        fi
+    fi
+
+    capture_space_comparison
+    stop_monitor
     cleanup_package
     cleanup_logs
 

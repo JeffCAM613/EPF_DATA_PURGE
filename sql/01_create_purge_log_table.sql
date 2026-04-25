@@ -1,10 +1,31 @@
 -- ============================================================================
--- EPF Data Purge - Audit/Log Table DDL
+-- EPF Data Purge - Audit/Log Table DDL & Supporting Types
 -- ============================================================================
 -- Creates the epf_purge_log table in the oppayments schema.
 -- This table records every purge operation for auditability and traceability.
--- The script is idempotent: it will not fail if the table already exists.
+-- Also creates the epf_number_tab nested-table type used for bulk-delete
+-- optimizations (materializing payment_ids per batch).
+-- The script is idempotent: it will not fail if objects already exist.
 -- ============================================================================
+
+-- Schema-level nested table type (no VARRAY 32K limit).
+-- Used by purge_bulk_payments to materialize payment_ids once per batch
+-- instead of repeating the join 7 times.
+DECLARE
+    l_type_exists NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO l_type_exists
+    FROM all_types
+    WHERE owner = 'OPPAYMENTS' AND type_name = 'EPF_NUMBER_TAB';
+
+    IF l_type_exists = 0 THEN
+        EXECUTE IMMEDIATE 'CREATE OR REPLACE TYPE oppayments.epf_number_tab AS TABLE OF NUMBER';
+        DBMS_OUTPUT.PUT_LINE('EPF_NUMBER_TAB type created successfully.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('EPF_NUMBER_TAB type already exists. Skipping creation.');
+    END IF;
+END;
+/
 
 DECLARE
     l_table_exists NUMBER;

@@ -1,0 +1,367 @@
+--truncate table oppayments.epf_purge_log;
+select * from  oppayments.epf_purge_log
+order by log_timestamp DESC;
+
+--04/19/2026 04:43:34.563104000 PM
+-- Check if the session is active (doing work, not waiting on a lock)
+SELECT status, event, seconds_in_wait, sql_id
+FROM v$session
+WHERE username = 'OPPAYMENTS' AND status = 'ACTIVE';
+SELECT status, event, seconds_in_wait, sql_id
+FROM v$session
+WHERE status = 'ACTIVE';
+--ACTIVE	db file sequential read	0	7rrw4m5kgb6ky
+
+-- Check for blocking locks (should return nothing if not stuck)
+SELECT * FROM v$lock WHERE type = 'TX' AND request > 0;
+--000000007D7AC990	000000007D7AC9C0	133	TX	393227	665	0	4	893	0	0
+
+
+---------------- for additional info these succeeded: 
+-- Redo log size and count (compare between old and clone)
+SELECT group#, bytes/1024/1024 AS size_mb, status FROM v$log;
+--4	1024	CURRENT
+--5	1024	INACTIVE
+--6	1024	INACTIVE
+--7	1024	INACTIVE
+
+-- How often log switch waits happen
+SELECT event, total_waits, time_waited_micro/1e6 AS wait_sec
+FROM v$system_event
+WHERE event LIKE 'log file switch%';
+--log file switch (checkpoint incomplete)	8	12.395892
+--log file switch completion	9	0.270938
+
+-- Compare buffer cache hit ratio (low = more physical I/O)
+SELECT name, value FROM v$sysstat
+WHERE name IN ('db block gets', 'consistent gets', 'physical reads');
+--db block gets	2893679
+--consistent gets	1299964511
+--physical reads	59791156
+
+
+
+
+
+
+
+-- Find the reclaim session (runs as SYS)
+SELECT sid, serial#, username, status, event, seconds_in_wait,
+       sql_id, last_call_et AS active_secs
+FROM v$session
+WHERE program LIKE '%sqlplus%'
+  AND status = 'ACTIVE';
+
+
+
+
+
+
+
+-- Check the actual GROUP BY in the deployed package body
+SELECT line, text 
+FROM dba_source 
+WHERE owner = 'OPPAYMENTS' 
+  AND name = 'EPF_PURGE_PKG' 
+  AND type = 'PACKAGE BODY'
+  AND UPPER(text) LIKE '%GROUP BY%TABLE_NAME%'
+ORDER BY line;
+
+
+
+
+
+
+
+
+
+-- Use 'BEFORE' instead of 'TEST'
+INSERT INTO oppayments.epf_purge_space_snapshot
+    (run_id, snapshot_phase, owner, segment_name, segment_type,
+     parent_table, size_bytes, size_mb)
+SELECT HEXTORAW('4FF78B935FA432AAE0630101007FB53F'), 'BEFORE', s.owner, s.segment_name, s.segment_type,
+       NVL(l.table_name, s.segment_name) AS parent_table,
+       SUM(s.bytes), ROUND(SUM(s.bytes) / 1048576, 2)
+FROM dba_segments s
+LEFT JOIN dba_lobs l
+    ON  l.owner = s.owner
+    AND l.segment_name = s.segment_name
+WHERE s.owner = 'OPPAYMENTS'
+GROUP BY s.owner, s.segment_name, s.segment_type,
+         NVL(l.table_name, s.segment_name);
+
+ROLLBACK;
+
+
+
+
+
+
+
+
+
+
+-- Step 1: Try the simple resize first (now that the overflow is fixed)
+ALTER DATABASE DATAFILE '/files2/oradata19/EPFPG781/undotbs01.dbf' RESIZE 1G;
+--Error starting at line : 93 in command -
+--ALTER DATABASE DATAFILE '/files2/oradata19/EPFPG781/undotbs01.dbf' RESIZE 1G
+--Error report -
+--ORA-03297: file contains used data beyond requested RESIZE value
+--
+--https://docs.oracle.com/error-help/db/ora-03297/03297. 00000 -  "File contains used data beyond requested RESIZE value."
+--*Cause:    Some portion of the file in the region to be trimmed was
+--           currently in use by one or more database objects.
+--*Action:   Drop or move segments containing extents in this region prior to
+--           resizing the file, or choose a RESIZE value limited to free
+--           space in the tail of the file being trimmed.
+
+-- Step 2: Nuclear option - swap undo tablespace
+-- Create a new 1 GB undo tablespace
+CREATE UNDO TABLESPACE UNDOTBS2
+    DATAFILE '/files2/oradata19/EPFPG781/undotbs02.dbf' SIZE 1G
+    AUTOEXTEND ON NEXT 256M MAXSIZE 8G;
+
+-- Switch to the new one (all new transactions use it)
+ALTER SYSTEM SET undo_tablespace = UNDOTBS2;
+
+-- Wait a few seconds for in-flight transactions to finish, then drop the old one
+-- (If any active txns remain, Oracle will wait for them)
+DROP TABLESPACE UNDOTBS1 INCLUDING CONTENTS AND DATAFILES;
+
+
+
+
+
+
+
+-- ============================================================
+-- STEP 1: Add larger redo log groups (run as SYSDBA)
+-- ============================================================
+-- Check current state
+SELECT group#, bytes/1024/1024 AS size_mb, status, members FROM v$log;
+--ALTER DATABASE DATAFILE '/files2/oradata19/EPFPG781/undotbs01.dbf' RESIZE 1G
+--Error report -
+--ORA-03297: file contains used data beyond requested RESIZE value
+--
+--https://docs.oracle.com/error-help/db/ora-03297/03297. 00000 -  "File contains used data beyond requested RESIZE value."
+--*Cause:    Some portion of the file in the region to be trimmed was
+--           currently in use by one or more database objects.
+--*Action:   Drop or move segments containing extents in this region prior to
+--           resizing the file, or choose a RESIZE value limited to free
+--           space in the tail of the file being trimmed.
+SELECT group#, member FROM v$logfile ORDER BY group#;
+--1	/files2/oradata19/EPFPG788/G1_1.log
+--2	/files2/oradata19/EPFPG788/G2_1.log
+--3	/files2/oradata19/EPFPG788/G3_1.log
+
+-- Replace the path below with what v$logfile returns
+-- Example if it shows: /u01/app/oracle/oradata/DBNAME/redo01.log -- need to get path dynamically
+ALTER DATABASE ADD LOGFILE GROUP 4 ('/files2/oradata19/EPFPG788/G4_1.log') SIZE 1G;
+ALTER DATABASE ADD LOGFILE GROUP 5 ('/files2/oradata19/EPFPG788/G5_1.log') SIZE 1G;
+ALTER DATABASE ADD LOGFILE GROUP 6 ('/files2/oradata19/EPFPG788/G6_1.log') SIZE 1G;
+ALTER DATABASE ADD LOGFILE GROUP 7 ('/files2/oradata19/EPFPG788/G7_1.log') SIZE 1G;
+
+-- Force Oracle to rotate into the new groups
+ALTER SYSTEM SWITCH LOGFILE;
+ALTER SYSTEM SWITCH LOGFILE;
+ALTER SYSTEM SWITCH LOGFILE;
+ALTER SYSTEM SWITCH LOGFILE;
+
+-- Wait a few seconds for checkpoints, then verify old groups are INACTIVE
+SELECT group#, bytes/1024/1024 AS size_mb, status FROM v$log;
+--1	150	ACTIVE
+--2	150	INACTIVE
+--3	150	INACTIVE
+--4	1024	ACTIVE
+--5	1024	ACTIVE
+--6	1024	ACTIVE
+--7	1024	CURRENT
+
+-- Drop old small groups (only if status = INACTIVE, never CURRENT)
+ALTER DATABASE DROP LOGFILE GROUP 1;
+ALTER DATABASE DROP LOGFILE GROUP 2;
+ALTER DATABASE DROP LOGFILE GROUP 3;
+-- If any says "ORA-01623: log group is current" just SWITCH LOGFILE again and retry
+
+ALTER SYSTEM CHECKPOINT;
+
+-- Verify all old groups are now INACTIVE
+SELECT group#, bytes/1024/1024 AS size_mb, status FROM v$log;
+--4	1024	INACTIVE
+--5	1024	INACTIVE
+--6	1024	INACTIVE
+--7	1024	CURRENT
+
+-- Then drop them
+ALTER DATABASE DROP LOGFILE GROUP 1;
+ALTER DATABASE DROP LOGFILE GROUP 2;
+ALTER DATABASE DROP LOGFILE GROUP 3;
+
+
+
+SHOW PARAMETER sga_target;
+SHOW PARAMETER sga_max_size;
+SHOW PARAMETER memory_target;
+--NAME       TYPE        VALUE 
+------------ ----------- ----- 
+--sga_target big integer 2480M 
+--NAME         TYPE        VALUE 
+-------------- ----------- ----- 
+--sga_max_size big integer 2480M 
+--NAME          TYPE        VALUE 
+--------------- ----------- ----- 
+--memory_target big integer 0     
+
+
+BEGIN
+    DBMS_STATS.GATHER_SCHEMA_STATS(
+        ownname => 'OPPAYMENTS',
+        estimate_percent => DBMS_STATS.AUTO_SAMPLE_SIZE,
+        cascade => TRUE,
+        degree => 4
+    );
+END;
+/
+
+
+
+
+
+
+
+
+
+
+
+-- Find who is blocking whom
+SELECT s1.sid AS blocked_sid, s1.username AS blocked_user,
+       s2.sid AS blocker_sid, s2.username AS blocker_user,
+       s2.status AS blocker_status, s2.event AS blocker_event,
+       s2.sql_id AS blocker_sql
+FROM v$session s1
+JOIN v$session s2 ON s1.blocking_session = s2.sid
+WHERE s1.blocking_session IS NOT NULL;
+--133	SYSTEM	753	OPPAYMENTS	ACTIVE	db file scattered read	f4j1jbg41qju7
+
+-- Check for dead/killed sessions still rolling back
+SELECT sid, serial#, status, username, event,
+       ROUND(last_call_et/60) AS minutes_ago
+FROM v$session
+WHERE status = 'KILLED'
+   OR (username = 'OPPAYMENTS' AND event LIKE '%undo%');
+   --norows
+
+-- Check SMON rollback progress
+SELECT usn, state, undoblockstotal, undoblocksdone,
+       CASE WHEN undoblockstotal > 0
+            THEN ROUND(undoblocksdone/undoblockstotal*100, 1)
+            ELSE 0 END AS pct_done
+FROM v$transaction
+WHERE status = 'ACTIVE';
+ORA-00904: "UNDOBLOCKSTOTAL": invalid identifier
+
+--https://docs.oracle.com/error-help/db/ora-00904/00904. 00000 -  "%s: invalid identifier"
+--*Cause:    The identifier or column name entered was invalid.
+--*Action:   Ensure the following
+--Error at Line: 185 Column: 39
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- What is SYSTEM SID 133 actually doing?
+SELECT sid, serial#, username, sql_id, module, action, program, event, state
+FROM v$session WHERE sid = 133;
+--133	41867	SYSTEM	9syys5mj8u16h	Data Pump Worker	SYS_IMPORT_SCHEMA_01	oracle@FR1SLVMKTP00788 (DW00)	enq: TX - row lock contention	WAITING
+
+-- What SQL is it running?
+SELECT sql_text FROM v$sql WHERE sql_id = (
+    SELECT sql_id FROM v$session WHERE sid = 133
+);
+--ALTER TABLE "OPPAYMENTS"."PAYMENT_AUDIT" ADD CONSTRAINT "PAYMENT_FK" FOREIGN KEY ("PAYMENT_ID") REFERENCES "OPPAYMENTS"."PAYMENT" ("PAYMENT_ID") ENABLE NOVALIDATE
+
+-- How many OPPAYMENTS sessions are open on this instance?
+SELECT sid, serial#, status, event, sql_id, module, program,
+       ROUND(last_call_et/60, 1) AS min_since_last_call
+FROM v$session WHERE username IN ('OPPAYMENTS', 'SYS', 'SYSTEM')
+ORDER BY username, sid;
+--753	36089	ACTIVE	db file scattered read	f4j1jbg41qju7	SQL*Plus	sqlplus.exe	59.2
+--494	27193	ACTIVE	OFS idle			oracle@FR1SLVMKTP00788 (OFSD)	146
+--874	33020	ACTIVE	SQL*Net message to client	8y2nbtsv7683w	SQL Developer	SQL Developer	0
+--133	41867	ACTIVE	enq: TX - row lock contention	9syys5mj8u16h	Data Pump Worker	oracle@FR1SLVMKTP00788 (DW00)	137.6
+--377	31800	ACTIVE	wait for unread message on broadcast channel	7wn3wubg7gjds	udi@FR1SLVMKTP00788 (TNS V1-V3)	udi@FR1SLVMKTP00788 (TNS V1-V3)	48.5
+--870	61633	ACTIVE	wait for unread message on broadcast channel	bjf05cwcj5s6p	Data Pump Master	oracle@FR1SLVMKTP00788 (DM00)	137.6
+
+
+
+-- Stop the Data Pump job gracefully
+-- First find the job name
+SELECT owner_name, job_name, state FROM dba_datapump_jobs WHERE state = 'EXECUTING';
+--SYSTEM	SYS_IMPORT_SCHEMA_01	EXECUTING
+-- Attach and kill it
+-- From a separate sqlplus session as the import user:
+-- impdp system/password@EPFPG788 attach=<job_name>
+-- Then at the Import> prompt: KILL_JOB
+
+-- Or just kill the sessions directly
+ALTER SYSTEM KILL SESSION '133,41867' IMMEDIATE;  -- Worker
+ALTER SYSTEM KILL SESSION '870,61633' IMMEDIATE;  -- Master
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-- Find sessions locking the package
+SELECT s.sid, s.serial#, s.username, s.program, s.status,
+       s.sql_id, s.last_call_et AS idle_secs
+FROM v$locked_object lo
+JOIN dba_objects o ON lo.object_id = o.object_id
+JOIN v$session s ON lo.session_id = s.sid
+WHERE o.object_name = 'EPF_PURGE_PKG';
+
+-- Find any session referencing OPPAYMENTS objects
+SELECT sid, serial#, username, program, status, last_call_et
+FROM v$session
+WHERE username = 'OPPAYMENTS'
+  AND sid != SYS_CONTEXT('USERENV', 'SID');
+  
+ALTER SYSTEM KILL SESSION 'sid,serial#' IMMEDIATE;
+
+
+
+-- Run as SYS/SYSDBA on the instance
+-- 1. Is the session alive and working?
+SELECT sid, serial#, username, status, event, seconds_in_wait,
+       sql_id, last_call_et AS active_secs,
+       module, action
+FROM v$session
+WHERE program LIKE '%sqlplus%'
+  AND status = 'ACTIVE';
+--258	21523	SYS	ACTIVE	direct path write	0	111fy9jsb89as	5596	sqlplus.exe
+--258	21523	SYS	ACTIVE	direct path write temp	0	111fy9jsb89as	6499	sqlplus.exe	
+
+-- 2. Quick check: what was the last DDL it ran?
+SELECT sql_text FROM v$sql WHERE sql_id = (
+    SELECT sql_id FROM v$session WHERE program LIKE '%sqlplus%' AND status = 'ACTIVE'
+    FETCH FIRST 1 ROW ONLY
+);
+--ALTER INDEX OPPAYMENTS.PAY_ADD_PAY_KEY_INDX REBUILD
+--ALTER INDEX OPPAYMENTS.PAY_ADD_PAY_KEY_INDX REBUILD
