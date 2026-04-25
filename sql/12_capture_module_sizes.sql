@@ -25,6 +25,20 @@ DECLARE
     v_total      NUMBER := 0;
     v_df_bytes   NUMBER := 0;
 
+    -- IMPORTANT: the DBA path uses dynamic SQL (OPEN ... FOR + EXECUTE
+    -- IMMEDIATE) intentionally. Static references to dba_segments / dba_lobs /
+    -- dba_data_files are resolved at COMPILE time, so when oppayments lacks
+    -- SELECT on those views (e.g. fresh DB before grant_dba_views runs) the
+    -- ENTIRE anonymous block fails to compile with ORA-00942, and the
+    -- EXCEPTION handler never executes -- the operator just sees a raw
+    -- "ERROR at line N" with no fallback. Dynamic SQL defers resolution to
+    -- runtime, so the WHEN OTHERS handler catches the privilege error and
+    -- falls back to user_segments cleanly.
+    cur          SYS_REFCURSOR;
+    v_owner      VARCHAR2(128);
+    v_parent     VARCHAR2(128);
+    v_bytes      NUMBER;
+
     -- Module classification helper (same logic as capture_space_snapshot
     -- in epf_purge_pkg).
     FUNCTION classify(p_owner VARCHAR2, p_table VARCHAR2) RETURN VARCHAR2 IS
@@ -58,39 +72,46 @@ BEGIN
 
     -- ------------------------------------------------------------------
     -- Try DBA path first: full coverage including op.spec_trt_log
+    -- (dynamic SQL so missing dba_* grants surface as runtime exceptions
+    -- caught by the WHEN OTHERS below, not as block-compile failures)
     -- ------------------------------------------------------------------
     BEGIN
-        FOR rec IN (
-            SELECT sg.owner,
-                   COALESCE(l.table_name, sg.segment_name) AS parent_table,
-                   SUM(sg.bytes) AS bytes
-            FROM dba_segments sg
-            LEFT JOIN dba_lobs l
-                ON l.owner = sg.owner AND l.segment_name = sg.segment_name
-            WHERE sg.tablespace_name = v_tablespace
-               OR (sg.owner = 'OP' AND sg.segment_name = 'SPEC_TRT_LOG')
-            GROUP BY sg.owner, COALESCE(l.table_name, sg.segment_name)
-        ) LOOP
-            v_total := v_total + rec.bytes;
-            CASE classify(rec.owner, rec.parent_table)
-                WHEN 'PAYMENTS'        THEN v_pay := v_pay + rec.bytes;
-                WHEN 'LOGS'            THEN v_log := v_log + rec.bytes;
-                WHEN 'BANK_STATEMENTS' THEN v_bst := v_bst + rec.bytes;
+        OPEN cur FOR
+            'SELECT sg.owner,
+                    COALESCE(l.table_name, sg.segment_name) AS parent_table,
+                    SUM(sg.bytes) AS bytes
+             FROM dba_segments sg
+             LEFT JOIN dba_lobs l
+                 ON l.owner = sg.owner AND l.segment_name = sg.segment_name
+             WHERE sg.tablespace_name = :ts
+                OR (sg.owner = ''OP'' AND sg.segment_name = ''SPEC_TRT_LOG'')
+             GROUP BY sg.owner, COALESCE(l.table_name, sg.segment_name)'
+        USING v_tablespace;
+        LOOP
+            FETCH cur INTO v_owner, v_parent, v_bytes;
+            EXIT WHEN cur%NOTFOUND;
+            v_total := v_total + v_bytes;
+            CASE classify(v_owner, v_parent)
+                WHEN 'PAYMENTS'        THEN v_pay := v_pay + v_bytes;
+                WHEN 'LOGS'            THEN v_log := v_log + v_bytes;
+                WHEN 'BANK_STATEMENTS' THEN v_bst := v_bst + v_bytes;
                 ELSE NULL;  -- OTHER counted in v_total only
             END CASE;
         END LOOP;
+        CLOSE cur;
 
         -- Datafile size of OPPAYMENTS default tablespace (for max-iter hint)
         BEGIN
-            SELECT NVL(SUM(bytes), 0) INTO v_df_bytes
-            FROM dba_data_files
-            WHERE tablespace_name = v_tablespace;
+            EXECUTE IMMEDIATE
+                'SELECT NVL(SUM(bytes), 0) FROM dba_data_files WHERE tablespace_name = :ts'
+                INTO v_df_bytes USING v_tablespace;
         EXCEPTION WHEN OTHERS THEN v_df_bytes := 0; END;
     EXCEPTION
         WHEN OTHERS THEN
             -- Fall back to user_segments. This misses op.spec_trt_log (in OP
             -- schema) and may miss any LOGS/BANK_STATEMENTS data outside this
             -- user's segments. Better than nothing.
+            BEGIN IF cur%ISOPEN THEN CLOSE cur; END IF; EXCEPTION WHEN OTHERS THEN NULL; END;
             v_pay := 0; v_log := 0; v_bst := 0; v_total := 0;
             FOR rec IN (
                 SELECT USER AS owner,
