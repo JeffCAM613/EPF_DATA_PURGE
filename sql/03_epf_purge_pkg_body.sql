@@ -179,6 +179,7 @@ AS
                     parent_table      VARCHAR2(128),
                     size_bytes        NUMBER         NOT NULL,
                     size_mb           NUMBER(12,2),
+                    module            VARCHAR2(20),
                     CONSTRAINT chk_snapshot_phase
                         CHECK (snapshot_phase IN (''BEFORE'', ''AFTER''))
                 )';
@@ -188,6 +189,20 @@ AS
                 ON oppayments.epf_purge_space_snapshot (run_id, snapshot_phase)';
 
             DBMS_OUTPUT.PUT_LINE('EPF_PURGE_SPACE_SNAPSHOT table created.');
+        ELSE
+            -- Migration: add module column if it doesn't exist (older installs)
+            DECLARE
+                l_col_exists NUMBER;
+            BEGIN
+                SELECT COUNT(*) INTO l_col_exists
+                FROM user_tab_columns
+                WHERE table_name = 'EPF_PURGE_SPACE_SNAPSHOT'
+                  AND column_name = 'MODULE';
+                IF l_col_exists = 0 THEN
+                    EXECUTE IMMEDIATE
+                        'ALTER TABLE oppayments.epf_purge_space_snapshot ADD (module VARCHAR2(20))';
+                END IF;
+            END;
         END IF;
     END ensure_log_table;
 
@@ -1467,6 +1482,32 @@ AS
         PRAGMA AUTONOMOUS_TRANSACTION;
         v_tablespace VARCHAR2(128);
         v_dba_sql    VARCHAR2(4000);
+        v_spec_trt_count NUMBER := 0;
+
+        -- Module classification CASE expression (kept inline so EXECUTE IMMEDIATE
+        -- can use it with bind variables; stored once in a constant for reuse
+        -- between the DBA path and the user_segments fallback path).
+        c_module_case CONSTANT VARCHAR2(2000) :=
+            q'[CASE
+                WHEN UPPER(parent_table) IN (
+                    'BULK_PAYMENT', 'BULK_PAYMENT_ADDITIONAL_INFO', 'BULK_SIGNATURE',
+                    'MANDATORY_SIGNERS', 'OIDC_REQUEST_TOKEN', 'PAYMENT',
+                    'PAYMENT_ADDITIONAL_INFO', 'PAYMENT_AUDIT', 'IMPORT_AUDIT',
+                    'IMPORT_AUDIT_MESSAGES', 'TRANSMISSION_EXECUTION',
+                    'TRANSMISSION_EXECUTION_AUDIT', 'TRANSMISSION_EXCEPTION',
+                    'NOTIFICATION_EXECUTION', 'APPROBATION_EXECUTION',
+                    'APPROBATION_EXECUTION_OPT', 'WORKFLOW_EXECUTION',
+                    'WORKFLOW_EXECUTION_OPT', 'BULKPAYMENT_EXCEPTION',
+                    'INVOICE', 'INVOICE_ADDITIONAL_INFO', 'FILE_INTEGRATION'
+                ) THEN 'PAYMENTS'
+                WHEN UPPER(parent_table) IN ('AUDIT_TRAIL', 'AUDIT_ARCHIVE')
+                    THEN 'LOGS'
+                WHEN owner = 'OP' AND UPPER(parent_table) = 'SPEC_TRT_LOG'
+                    THEN 'LOGS'
+                WHEN UPPER(parent_table) IN ('DIRECTORY_DISPATCHING', 'FILE_DISPATCHING')
+                    THEN 'BANK_STATEMENTS'
+                ELSE 'OTHER'
+            END]';
     BEGIN
         -- Determine the OPPAYMENTS default tablespace (user_users needs no DBA grants)
         BEGIN
@@ -1476,25 +1517,32 @@ AS
         END;
 
         -- Build DBA query: capture ALL segments in the tablespace so totals
-        -- match the reclaim script (which also measures by tablespace).
+        -- match the reclaim script (which also measures by tablespace), and
+        -- tag each row with its purge module so the comparison report can
+        -- group + filter by depth.
         v_dba_sql :=
             'INSERT INTO oppayments.epf_purge_space_snapshot
                 (run_id, snapshot_phase, owner, segment_name, segment_type,
-                 parent_table, size_bytes, size_mb)
-            SELECT :run_id, :phase, sg.owner, sg.segment_name, sg.segment_type,
-                   COALESCE(l.table_name, sg.segment_name) AS parent_table,
-                   sg.total_bytes, ROUND(sg.total_bytes / 1048576, 2)
+                 parent_table, size_bytes, size_mb, module)
+            SELECT :run_id, :phase, owner, segment_name, segment_type,
+                   parent_table, size_bytes, size_mb, ' || c_module_case || '
             FROM (
-                SELECT owner, segment_name, segment_type, SUM(bytes) AS total_bytes
-                FROM dba_segments
-                WHERE tablespace_name = :ts
-                GROUP BY owner, segment_name, segment_type
-            ) sg
-            LEFT JOIN (
-                SELECT owner, segment_name, MIN(table_name) AS table_name
-                FROM dba_lobs
-                GROUP BY owner, segment_name
-            ) l ON l.owner = sg.owner AND l.segment_name = sg.segment_name';
+                SELECT sg.owner, sg.segment_name, sg.segment_type,
+                       COALESCE(l.table_name, sg.segment_name) AS parent_table,
+                       sg.total_bytes AS size_bytes,
+                       ROUND(sg.total_bytes / 1048576, 2) AS size_mb
+                FROM (
+                    SELECT owner, segment_name, segment_type, SUM(bytes) AS total_bytes
+                    FROM dba_segments
+                    WHERE tablespace_name = :ts
+                    GROUP BY owner, segment_name, segment_type
+                ) sg
+                LEFT JOIN (
+                    SELECT owner, segment_name, MIN(table_name) AS table_name
+                    FROM dba_lobs
+                    GROUP BY owner, segment_name
+                ) l ON l.owner = sg.owner AND l.segment_name = sg.segment_name
+            )';
 
         DBMS_OUTPUT.PUT_LINE('[SNAPSHOT] Phase: ' || p_snapshot_phase
             || ' | Tablespace: ' || NVL(v_tablespace, '(unknown)'));
@@ -1509,23 +1557,62 @@ AS
                 DBMS_OUTPUT.PUT_LINE('[SNAPSHOT] To fix, run as SYS:');
                 DBMS_OUTPUT.PUT_LINE('[SNAPSHOT]   GRANT SELECT ON sys.dba_segments TO oppayments;');
                 DBMS_OUTPUT.PUT_LINE('[SNAPSHOT]   GRANT SELECT ON sys.dba_lobs TO oppayments;');
-                -- Fall back to user_segments / user_lobs (no DBA privileges)
+                -- Fall back to user_segments / user_lobs (no DBA privileges).
+                -- USER is the owner constant; module CASE works the same way.
+                EXECUTE IMMEDIATE
+                    'INSERT INTO oppayments.epf_purge_space_snapshot
+                        (run_id, snapshot_phase, owner, segment_name, segment_type,
+                         parent_table, size_bytes, size_mb, module)
+                    SELECT :run_id, :phase, USER AS owner, segment_name, segment_type,
+                           parent_table, size_bytes, size_mb, ' || c_module_case || '
+                    FROM (
+                        SELECT USER AS owner, sg.segment_name, sg.segment_type,
+                               COALESCE(l.table_name, sg.segment_name) AS parent_table,
+                               sg.total_bytes AS size_bytes,
+                               ROUND(sg.total_bytes / 1048576, 2) AS size_mb
+                        FROM (
+                            SELECT segment_name, segment_type, SUM(bytes) AS total_bytes
+                            FROM user_segments
+                            GROUP BY segment_name, segment_type
+                        ) sg
+                        LEFT JOIN (
+                            SELECT segment_name, MIN(table_name) AS table_name
+                            FROM user_lobs
+                            GROUP BY segment_name
+                        ) l ON l.segment_name = sg.segment_name
+                    )'
+                    USING p_run_id, p_snapshot_phase;
+        END;
+
+        -- op.spec_trt_log lives in the OP schema and may be in a different
+        -- tablespace than OPPAYMENTS default. The main capture above filters
+        -- by tablespace, so spec_trt_log can be missed. If it isn't already
+        -- in the snapshot for this run/phase, capture it explicitly here.
+        BEGIN
+            SELECT COUNT(*) INTO v_spec_trt_count
+            FROM oppayments.epf_purge_space_snapshot
+            WHERE run_id = p_run_id
+              AND snapshot_phase = p_snapshot_phase
+              AND owner = 'OP'
+              AND UPPER(parent_table) = 'SPEC_TRT_LOG';
+
+            IF v_spec_trt_count = 0 THEN
                 INSERT INTO oppayments.epf_purge_space_snapshot
                     (run_id, snapshot_phase, owner, segment_name, segment_type,
-                     parent_table, size_bytes, size_mb)
-                SELECT p_run_id, p_snapshot_phase, USER, sg.segment_name, sg.segment_type,
-                       COALESCE(l.table_name, sg.segment_name) AS parent_table,
-                       sg.total_bytes, ROUND(sg.total_bytes / 1048576, 2)
-                FROM (
-                    SELECT segment_name, segment_type, SUM(bytes) AS total_bytes
-                    FROM user_segments
-                    GROUP BY segment_name, segment_type
-                ) sg
-                LEFT JOIN (
-                    SELECT segment_name, MIN(table_name) AS table_name
-                    FROM user_lobs
-                    GROUP BY segment_name
-                ) l ON l.segment_name = sg.segment_name;
+                     parent_table, size_bytes, size_mb, module)
+                SELECT p_run_id, p_snapshot_phase, owner, segment_name, segment_type,
+                       'SPEC_TRT_LOG' AS parent_table,
+                       SUM(bytes) AS size_bytes,
+                       ROUND(SUM(bytes) / 1048576, 2) AS size_mb,
+                       'LOGS' AS module
+                FROM dba_segments
+                WHERE owner = 'OP' AND segment_name = 'SPEC_TRT_LOG'
+                GROUP BY owner, segment_name, segment_type;
+            END IF;
+        EXCEPTION
+            WHEN OTHERS THEN
+                DBMS_OUTPUT.PUT_LINE('[SNAPSHOT] Could not capture op.spec_trt_log explicitly: '
+                    || SQLERRM);
         END;
 
         DECLARE
@@ -1550,85 +1637,208 @@ AS
     -- ========================================================================
     -- print_space_comparison
     -- ========================================================================
-    -- Prints a before/after comparison of segment sizes, grouped by
-    -- owner + parent table (so LOB segments roll up into their parent
-    -- table's total, and cross-schema segments are shown separately).
-    PROCEDURE print_space_comparison(p_run_id IN RAW)
+    -- Prints a depth-aware before/after comparison:
+    --   - All 27 purged tables shown (always), grouped by module (PAYMENTS,
+    --     LOGS, BANK_STATEMENTS), sorted by owner.table_name within each.
+    --   - Only modules covered by p_depth are shown. ALL = all three.
+    --   - Per-module subtotal at the end of each block.
+    --   - PURGED TABLES TOTAL (sum of shown modules) at the bottom.
+    --   - TABLESPACE TOTAL (sum of all snapshot rows including OTHER) for
+    --     a sanity check against the reclaim report.
+    --   - Rows for tables that have zero size in both snapshots still appear
+    --     (with 0.00 / 0.00 / 0.0%).
+    PROCEDURE print_space_comparison(
+        p_run_id IN RAW,
+        p_depth  IN VARCHAR2 DEFAULT C_DEPTH_ALL
+    )
     IS
-        l_total_before NUMBER := 0;
-        l_total_after  NUMBER := 0;
+        l_show_payments BOOLEAN :=
+            UPPER(p_depth) IN (C_DEPTH_ALL, C_DEPTH_PAYMENTS);
+        l_show_logs BOOLEAN :=
+            UPPER(p_depth) IN (C_DEPTH_ALL, C_DEPTH_LOGS);
+        l_show_bank BOOLEAN :=
+            UPPER(p_depth) IN (C_DEPTH_ALL, C_DEPTH_BANK_STATEMENTS);
+
+        l_purged_before NUMBER := 0;
+        l_purged_after  NUMBER := 0;
+
+        l_ts_before NUMBER := 0;
+        l_ts_after  NUMBER := 0;
+
+        -- Hardcoded master list of the 27 purged tables, in the canonical
+        -- module order (PAYMENTS -> LOGS -> BANK_STATEMENTS), alphabetised
+        -- inside each module. Ensures a row appears for every purged table
+        -- even if it has no segment in the snapshot.
+        TYPE t_table_def IS RECORD (
+            owner   VARCHAR2(30),
+            tname   VARCHAR2(128),
+            module  VARCHAR2(20)
+        );
+        TYPE t_table_def_list IS TABLE OF t_table_def INDEX BY PLS_INTEGER;
+        l_tables t_table_def_list;
+        l_idx    PLS_INTEGER := 0;
+
+        PROCEDURE add_table(p_owner VARCHAR2, p_tname VARCHAR2, p_module VARCHAR2) IS
+        BEGIN
+            l_idx := l_idx + 1;
+            l_tables(l_idx).owner := p_owner;
+            l_tables(l_idx).tname := p_tname;
+            l_tables(l_idx).module := p_module;
+        END;
+
+        FUNCTION fmt_row(
+            p_label   VARCHAR2,
+            p_before  NUMBER,
+            p_after   NUMBER
+        ) RETURN VARCHAR2 IS
+            l_freed NUMBER := p_before - p_after;
+            l_pct   NUMBER :=
+                CASE WHEN p_before > 0 THEN ROUND(l_freed / p_before * 100, 1)
+                     ELSE 0 END;
+        BEGIN
+            RETURN RPAD(p_label, 44)
+                || LPAD(TO_CHAR(p_before, '999,990.00'), 13)
+                || LPAD(TO_CHAR(p_after,  '999,990.00'), 13)
+                || LPAD(TO_CHAR(l_freed,  '999,990.00'), 13)
+                || LPAD(TO_CHAR(l_pct, '990.0') || '%', 8);
+        END;
+
+        PROCEDURE print_module_block(
+            p_module IN VARCHAR2
+        ) IS
+            l_sub_before NUMBER := 0;
+            l_sub_after  NUMBER := 0;
+            l_before NUMBER;
+            l_after  NUMBER;
+        BEGIN
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('[' || p_module || ']');
+
+            FOR i IN 1 .. l_tables.COUNT LOOP
+                IF l_tables(i).module = p_module THEN
+                    -- Sum BEFORE size_mb for this owner.parent_table
+                    BEGIN
+                        SELECT NVL(SUM(size_mb), 0) INTO l_before
+                        FROM oppayments.epf_purge_space_snapshot
+                        WHERE run_id = p_run_id
+                          AND snapshot_phase = 'BEFORE'
+                          AND owner = l_tables(i).owner
+                          AND UPPER(parent_table) = UPPER(l_tables(i).tname);
+                    EXCEPTION WHEN OTHERS THEN l_before := 0;
+                    END;
+
+                    BEGIN
+                        SELECT NVL(SUM(size_mb), 0) INTO l_after
+                        FROM oppayments.epf_purge_space_snapshot
+                        WHERE run_id = p_run_id
+                          AND snapshot_phase = 'AFTER'
+                          AND owner = l_tables(i).owner
+                          AND UPPER(parent_table) = UPPER(l_tables(i).tname);
+                    EXCEPTION WHEN OTHERS THEN l_after := 0;
+                    END;
+
+                    DBMS_OUTPUT.PUT_LINE('  ' ||
+                        fmt_row(l_tables(i).owner || '.' || l_tables(i).tname,
+                                l_before, l_after));
+
+                    l_sub_before := l_sub_before + l_before;
+                    l_sub_after  := l_sub_after  + l_after;
+                END IF;
+            END LOOP;
+
+            DBMS_OUTPUT.PUT_LINE('  ' || RPAD('-', 89, '-'));
+            DBMS_OUTPUT.PUT_LINE('  ' ||
+                fmt_row(p_module || ' subtotal', l_sub_before, l_sub_after));
+
+            l_purged_before := l_purged_before + l_sub_before;
+            l_purged_after  := l_purged_after  + l_sub_after;
+        END;
+
     BEGIN
+        -- ------------------------------------------------------------------
+        -- Build the master table list (27 tables, fixed order)
+        -- ------------------------------------------------------------------
+        -- PAYMENTS module (22 tables, alphabetical by name)
+        add_table('OPPAYMENTS', 'APPROBATION_EXECUTION',         'PAYMENTS');
+        add_table('OPPAYMENTS', 'APPROBATION_EXECUTION_OPT',     'PAYMENTS');
+        add_table('OPPAYMENTS', 'BULK_PAYMENT',                  'PAYMENTS');
+        add_table('OPPAYMENTS', 'BULK_PAYMENT_ADDITIONAL_INFO',  'PAYMENTS');
+        add_table('OPPAYMENTS', 'BULK_SIGNATURE',                'PAYMENTS');
+        add_table('OPPAYMENTS', 'BULKPAYMENT_EXCEPTION',         'PAYMENTS');
+        add_table('OPPAYMENTS', 'FILE_INTEGRATION',              'PAYMENTS');
+        add_table('OPPAYMENTS', 'IMPORT_AUDIT',                  'PAYMENTS');
+        add_table('OPPAYMENTS', 'IMPORT_AUDIT_MESSAGES',         'PAYMENTS');
+        add_table('OPPAYMENTS', 'INVOICE',                       'PAYMENTS');
+        add_table('OPPAYMENTS', 'INVOICE_ADDITIONAL_INFO',       'PAYMENTS');
+        add_table('OPPAYMENTS', 'MANDATORY_SIGNERS',             'PAYMENTS');
+        add_table('OPPAYMENTS', 'NOTIFICATION_EXECUTION',        'PAYMENTS');
+        add_table('OPPAYMENTS', 'OIDC_REQUEST_TOKEN',            'PAYMENTS');
+        add_table('OPPAYMENTS', 'PAYMENT',                       'PAYMENTS');
+        add_table('OPPAYMENTS', 'PAYMENT_ADDITIONAL_INFO',       'PAYMENTS');
+        add_table('OPPAYMENTS', 'PAYMENT_AUDIT',                 'PAYMENTS');
+        add_table('OPPAYMENTS', 'TRANSMISSION_EXCEPTION',        'PAYMENTS');
+        add_table('OPPAYMENTS', 'TRANSMISSION_EXECUTION',        'PAYMENTS');
+        add_table('OPPAYMENTS', 'TRANSMISSION_EXECUTION_AUDIT',  'PAYMENTS');
+        add_table('OPPAYMENTS', 'WORKFLOW_EXECUTION',            'PAYMENTS');
+        add_table('OPPAYMENTS', 'WORKFLOW_EXECUTION_OPT',        'PAYMENTS');
+        -- LOGS module (3 tables, alphabetical)
+        add_table('OP',         'SPEC_TRT_LOG',                  'LOGS');
+        add_table('OPPAYMENTS', 'AUDIT_ARCHIVE',                 'LOGS');
+        add_table('OPPAYMENTS', 'AUDIT_TRAIL',                   'LOGS');
+        -- BANK_STATEMENTS module (2 tables, alphabetical)
+        add_table('OPPAYMENTS', 'DIRECTORY_DISPATCHING',         'BANK_STATEMENTS');
+        add_table('OPPAYMENTS', 'FILE_DISPATCHING',              'BANK_STATEMENTS');
+
+        -- ------------------------------------------------------------------
+        -- Header
+        -- ------------------------------------------------------------------
         DBMS_OUTPUT.PUT_LINE('');
-        DBMS_OUTPUT.PUT_LINE('============================================================');
-        DBMS_OUTPUT.PUT_LINE('  SPACE USAGE COMPARISON (Before vs After Purge)');
-        DBMS_OUTPUT.PUT_LINE('  Run ID: ' || RAWTOHEX(p_run_id));
-        DBMS_OUTPUT.PUT_LINE('============================================================');
-        DBMS_OUTPUT.PUT_LINE(
-            RPAD('Owner.Segment / Table', 42)
-            || LPAD('Before(MB)', 12)
-            || LPAD('After(MB)', 12)
-            || LPAD('Freed(MB)', 12)
-            || LPAD('Freed%', 8)
-        );
-        DBMS_OUTPUT.PUT_LINE(RPAD('-', 86, '-'));
+        DBMS_OUTPUT.PUT_LINE('====================================================================================');
+        DBMS_OUTPUT.PUT_LINE('  SPACE USAGE COMPARISON (Before vs After)');
+        DBMS_OUTPUT.PUT_LINE('  Run ID: ' || RAWTOHEX(p_run_id) || '   Depth: ' || NVL(UPPER(p_depth), C_DEPTH_ALL));
+        DBMS_OUTPUT.PUT_LINE('====================================================================================');
+        DBMS_OUTPUT.PUT_LINE(RPAD('Owner.Table', 44)
+            || LPAD('Before(MB)', 13)
+            || LPAD('After(MB)', 13)
+            || LPAD('Freed(MB)', 13)
+            || LPAD('Freed%', 8));
 
-        FOR rec IN (
-            SELECT NVL(b.owner, a.owner) AS owner,
-                   NVL(b.parent_table, a.parent_table) AS parent_table,
-                   NVL(b.total_mb, 0) AS before_mb,
-                   NVL(a.total_mb, 0) AS after_mb,
-                   NVL(b.total_mb, 0) - NVL(a.total_mb, 0) AS freed_mb,
-                   CASE WHEN NVL(b.total_mb, 0) > 0
-                        THEN ROUND((NVL(b.total_mb, 0) - NVL(a.total_mb, 0))
-                                   / b.total_mb * 100, 1)
-                        ELSE 0
-                   END AS freed_pct
-            FROM (
-                SELECT owner, parent_table, SUM(size_mb) AS total_mb
-                FROM oppayments.epf_purge_space_snapshot
-                WHERE run_id = p_run_id AND snapshot_phase = 'BEFORE'
-                GROUP BY owner, parent_table
-            ) b
-            FULL OUTER JOIN (
-                SELECT owner, parent_table, SUM(size_mb) AS total_mb
-                FROM oppayments.epf_purge_space_snapshot
-                WHERE run_id = p_run_id AND snapshot_phase = 'AFTER'
-                GROUP BY owner, parent_table
-            ) a ON b.owner = a.owner AND b.parent_table = a.parent_table
-            ORDER BY NVL(b.total_mb, 0) DESC
-        ) LOOP
-            -- Only show segments > 0.01 MB to avoid noise
-            IF rec.before_mb >= 0.01 OR rec.after_mb >= 0.01 THEN
-                DBMS_OUTPUT.PUT_LINE(
-                    RPAD(rec.owner || '.' || rec.parent_table, 42)
-                    || LPAD(TO_CHAR(rec.before_mb, '999,990.00'), 12)
-                    || LPAD(TO_CHAR(rec.after_mb, '999,990.00'), 12)
-                    || LPAD(TO_CHAR(rec.freed_mb, '999,990.00'), 12)
-                    || LPAD(TO_CHAR(rec.freed_pct, '990.0') || '%', 8)
-                );
-                l_total_before := l_total_before + rec.before_mb;
-                l_total_after := l_total_after + rec.after_mb;
-            END IF;
-        END LOOP;
+        -- ------------------------------------------------------------------
+        -- Module blocks (only those covered by depth)
+        -- ------------------------------------------------------------------
+        IF l_show_payments THEN print_module_block('PAYMENTS');        END IF;
+        IF l_show_logs     THEN print_module_block('LOGS');            END IF;
+        IF l_show_bank     THEN print_module_block('BANK_STATEMENTS'); END IF;
 
-        DBMS_OUTPUT.PUT_LINE(RPAD('-', 86, '-'));
-        DBMS_OUTPUT.PUT_LINE(
-            RPAD('TOTAL (TABLESPACE)', 42)
-            || LPAD(TO_CHAR(l_total_before, '999,990.00'), 12)
-            || LPAD(TO_CHAR(l_total_after, '999,990.00'), 12)
-            || LPAD(TO_CHAR(l_total_before - l_total_after, '999,990.00'), 12)
-            || LPAD(CASE WHEN l_total_before > 0
-                        THEN TO_CHAR(ROUND((l_total_before - l_total_after)
-                                           / l_total_before * 100, 1), '990.0') || '%'
-                        ELSE '  0.0%'
-                   END, 8)
-        );
-        DBMS_OUTPUT.PUT_LINE('============================================================');
-        DBMS_OUTPUT.PUT_LINE('NOTE: With DBA views, totals cover the full tablespace and');
-        DBMS_OUTPUT.PUT_LINE('should match the reclaim report. Without DBA views, only');
-        DBMS_OUTPUT.PUT_LINE('the current user''s segments are included (totals will be');
-        DBMS_OUTPUT.PUT_LINE('lower than the reclaim report).');
-        DBMS_OUTPUT.PUT_LINE('============================================================');
+        -- ------------------------------------------------------------------
+        -- Tablespace-wide totals (every captured row, including OTHER and
+        -- non-purged segments). Read straight from the snapshot.
+        -- ------------------------------------------------------------------
+        BEGIN
+            SELECT NVL(SUM(size_mb), 0) INTO l_ts_before
+            FROM oppayments.epf_purge_space_snapshot
+            WHERE run_id = p_run_id AND snapshot_phase = 'BEFORE';
+        EXCEPTION WHEN OTHERS THEN l_ts_before := 0; END;
+
+        BEGIN
+            SELECT NVL(SUM(size_mb), 0) INTO l_ts_after
+            FROM oppayments.epf_purge_space_snapshot
+            WHERE run_id = p_run_id AND snapshot_phase = 'AFTER';
+        EXCEPTION WHEN OTHERS THEN l_ts_after := 0; END;
+
+        DBMS_OUTPUT.PUT_LINE('');
+        DBMS_OUTPUT.PUT_LINE(RPAD('=', 89, '='));
+        DBMS_OUTPUT.PUT_LINE('  ' ||
+            fmt_row('PURGED TABLES TOTAL (shown modules)',
+                    l_purged_before, l_purged_after));
+        DBMS_OUTPUT.PUT_LINE('  ' ||
+            fmt_row('TABLESPACE TOTAL (incl. non-purged)',
+                    l_ts_before, l_ts_after));
+        DBMS_OUTPUT.PUT_LINE(RPAD('=', 89, '='));
+        DBMS_OUTPUT.PUT_LINE('NOTE: TABLESPACE TOTAL covers every segment captured in OPPAYMENTS''');
+        DBMS_OUTPUT.PUT_LINE('default tablespace; it should match the reclaim script''s "Used space"');
+        DBMS_OUTPUT.PUT_LINE('numbers when DBA views are accessible. Without DBA views the totals');
+        DBMS_OUTPUT.PUT_LINE('only cover OPPAYMENTS-owned segments.');
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -1672,15 +1882,11 @@ AS
                                 || ', dry_run=' || CASE WHEN p_dry_run THEN 'Y' ELSE 'N' END
         );
 
-        DBMS_OUTPUT.PUT_LINE('============================================================');
-        DBMS_OUTPUT.PUT_LINE('  EPF DATA PURGE');
-        DBMS_OUTPUT.PUT_LINE('  Run ID:     ' || RAWTOHEX(l_run_id));
-        DBMS_OUTPUT.PUT_LINE('  Depth:      ' || l_depth);
-        DBMS_OUTPUT.PUT_LINE('  Retention:  ' || p_retention_days || ' days');
-        DBMS_OUTPUT.PUT_LINE('  Cutoff:     ' || TO_CHAR(l_cutoff_date, 'YYYY-MM-DD'));
-        DBMS_OUTPUT.PUT_LINE('  Batch size: ' || p_batch_size);
-        DBMS_OUTPUT.PUT_LINE('  Dry run:    ' || CASE WHEN p_dry_run THEN 'YES' ELSE 'NO' END);
-        DBMS_OUTPUT.PUT_LINE('============================================================');
+        -- The wrapper script already prints a Configuration Summary header
+        -- before invoking run_purge, and the live monitor surfaces RUN_START
+        -- with the same metadata. The duplicate banner here was redundant
+        -- noise in the buffered DBMS_OUTPUT flood that arrived after the
+        -- block ended. Run metadata lives in epf_purge_log instead.
 
         -- Capture space usage BEFORE purge
         capture_space_snapshot(l_run_id, 'BEFORE');

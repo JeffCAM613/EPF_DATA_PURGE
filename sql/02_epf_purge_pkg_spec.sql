@@ -142,9 +142,18 @@ AS
         p_snapshot_phase IN VARCHAR2  -- 'BEFORE' or 'AFTER'
     );
 
-    -- Prints a before/after comparison of segment sizes for a given run.
-    -- Shows size change (MB) and percentage freed per segment.
-    PROCEDURE print_space_comparison(p_run_id IN RAW);
+    -- Prints a before/after comparison of segment sizes for a given run,
+    -- depth-aware: only the modules covered by p_depth are shown, all 27
+    -- purged tables are listed (sorted by module then name), per-module
+    -- subtotals plus PURGED TABLES TOTAL and TABLESPACE TOTAL.
+    --
+    -- Parameters:
+    --   p_run_id - The run to report on
+    --   p_depth  - ALL, PAYMENTS, LOGS, or BANK_STATEMENTS (default ALL)
+    PROCEDURE print_space_comparison(
+        p_run_id IN RAW,
+        p_depth  IN VARCHAR2 DEFAULT C_DEPTH_ALL
+    );
 
 END epf_purge_pkg;
 /

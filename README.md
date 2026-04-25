@@ -59,6 +59,32 @@ chmod +x bin/epf_purge.sh
 ./bin/epf_purge.sh
 ```
 
+The depth prompt now shows the current data size for each option so you can
+pick the right scope without a separate query:
+
+```
+  Purge Depth
+  Controls which data modules are purged:
+    ALL              [~11.67 GB]  Purge all modules (payments, logs, bank statements)
+    PAYMENTS         [~ 5.40 GB]  Purge bulk payments and file integrations only
+    LOGS             [~ 0.42 GB]  Purge audit trails and technical logs only
+    BANK_STATEMENTS  [~ 5.85 GB]  Purge bank statement dispatching only
+```
+
+### Live progress monitor
+
+The wrapper opens a **separate console window** (Windows) or backgrounds the
+monitor with stdout suppressed (Linux). The main wrapper console stays focused
+on summary lines (configuration, `[INFO]/[OK]/[WARN]`); live updates appear in
+the separate window. Both are also appended to the log file in chronological
+order, so the file is the canonical record.
+
+- **Windows:** a new "EPF Live Monitor" cmd window opens automatically. It
+  stays open after the monitor exits so you can read the final
+  `RECLAIM_END` / `RUN_END` lines; close it manually.
+- **Linux:** the monitor runs in the background. Watch live updates from
+  another terminal with `tail -f logs/epf_purge_<timestamp>.log`.
+
 ### 2. Dry Run First (Always Recommended)
 
 See how many rows would be deleted, without deleting anything:
@@ -112,12 +138,21 @@ bin\epf_purge.bat --tns EPFPROD --user oppayments --depth BANK_STATEMENTS --rete
 | `--optimize-db` | off | Pre-purge optimization: enlarge redo logs to 1 GB and gather optimizer stats. Needs SYS. |
 | `--reclaim` | off | Post-purge space reclamation: SHRINK segments + squeeze + resize datafiles. Needs SYS. |
 | `--reclaim-only` | off | Skip the purge, only reclaim space. Useful if you already purged earlier. |
+| `--max-iterations N` | *(auto)* | Cap for the squeeze loop. Wrapper recommends `max(2000, 50 × datafile_gb)`, capped at 20000, based on the OPPAYMENTS tablespace datafile size queried at startup. |
 | `--no-stall-check` | off | Disable stall detection during space reclamation. |
 | `--drop-pkg` | off | Remove the PL/SQL package from the database after the purge finishes. |
 | `--drop-logs` | off | Remove the audit log tables (`epf_purge_log`, `epf_purge_space_snapshot`). They will be recreated on next run. |
-| `--sys-password PASS` | *(prompted)* | Password for SYS (only needed for `--optimize-db` and `--reclaim`). |
+| `--sys-password PASS` | *(prompted)* | Password for SYS (only needed for `--optimize-db` and `--reclaim`). Prefer `EPF_SYS_PASSWORD` env var. |
 | `--assume-yes` / `-y` | off | Skip all confirmation prompts. For automated/scheduled runs. |
 | `--config FILE` | *(none)* | Load settings from a config file instead of command-line arguments. |
+| `--show-sizes` | off | **DEPRECATED.** Module sizes are now always shown in the depth prompt and configuration summary. Flag still accepted but does nothing. |
+
+### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `EPF_PURGE_PASSWORD` | Database password for the OPPAYMENTS user. Overrides `--password` and config file. |
+| `EPF_SYS_PASSWORD` | SYS / DBA password. Overrides `--sys-password` and config file. Use for unattended runs with `--reclaim` or `--optimize-db`. |
 
 ### Purge Depth Options
 

@@ -92,6 +92,7 @@ BEGIN
                 parent_table      VARCHAR2(128),
                 size_bytes        NUMBER         NOT NULL,
                 size_mb           NUMBER(12,2),
+                module            VARCHAR2(20),
                 CONSTRAINT chk_snapshot_phase
                     CHECK (snapshot_phase IN (''BEFORE'', ''AFTER''))
             )';
@@ -103,6 +104,26 @@ BEGIN
         DBMS_OUTPUT.PUT_LINE('EPF_PURGE_SPACE_SNAPSHOT table created successfully.');
     ELSE
         DBMS_OUTPUT.PUT_LINE('EPF_PURGE_SPACE_SNAPSHOT table already exists. Skipping creation.');
+    END IF;
+END;
+/
+
+-- Migration for existing installs: add module column if it doesn't exist.
+-- Tags each captured segment with its purge module so the comparison report
+-- can group + filter by depth (PAYMENTS / LOGS / BANK_STATEMENTS / OTHER).
+DECLARE
+    l_col_exists NUMBER;
+BEGIN
+    SELECT COUNT(*) INTO l_col_exists
+    FROM all_tab_columns
+    WHERE owner = 'OPPAYMENTS'
+      AND table_name = 'EPF_PURGE_SPACE_SNAPSHOT'
+      AND column_name = 'MODULE';
+
+    IF l_col_exists = 0 THEN
+        EXECUTE IMMEDIATE
+            'ALTER TABLE oppayments.epf_purge_space_snapshot ADD (module VARCHAR2(20))';
+        DBMS_OUTPUT.PUT_LINE('EPF_PURGE_SPACE_SNAPSHOT.module column added.');
     END IF;
 END;
 /

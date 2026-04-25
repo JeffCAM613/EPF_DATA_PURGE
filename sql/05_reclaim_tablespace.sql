@@ -43,10 +43,16 @@ SET LINESIZE 200
 SET FEEDBACK OFF
 SET VERIFY OFF
 
--- Accept parameters with defaults
-DEFINE target_pct_free   = 10
-DEFINE max_iterations    = 2000
-DEFINE skip_stall_checks = N
+-- Accept parameters via positional args. Wrapper scripts always pass all
+-- three; ad-hoc invocations can use:
+--   @05_reclaim_tablespace.sql 10 2000 N
+-- (Previously this section did `DEFINE x = literal` which silently
+--  overrode any wrapper-pre-DEFINE -- the wrapper's --no-stall-check and
+--  --max-iterations had no effect. Switching to positional bindings
+--  fixes that.)
+DEFINE target_pct_free   = &1
+DEFINE max_iterations    = &2
+DEFINE skip_stall_checks = &3
 
 DECLARE
     -- Configuration

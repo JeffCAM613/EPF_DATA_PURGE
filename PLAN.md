@@ -32,6 +32,14 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) Phase 1 loop — emit `SHRINK_PROGRESS` every 10 tables OR 60s; removed buffered per-table `SHRINK OK` print
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — top-level `EXCEPTION WHEN OTHERS` emits `RECLAIM_END status=ERROR` then re-raises
 
+**Phase 1 follow-up round 3.1 (cmd parser hotfix after fourth user test):**
+- Symptom: ". was unexpected at this time." right after the [INFO] messages, purge never started.
+- Root cause: two cmd parser pitfalls in the round-3 .bat code:
+  1. `> "%TEMP%\epf_monitor_launcher.bat" ( ... )` block contained `echo echo.` lines. Inside cmd's parens-block parser, the dot immediately following an embedded `echo` token tickles the "echo blank line" special form.
+  2. `if exist (...)` blocks had echoes ending in `(... PID: !VAR!).` — the `(` and `)` count toward the if-block's paren depth, and the trailing `.` lands in a parser state that errors out.
+- [bin/epf_purge.bat](bin/epf_purge.bat) — replaced the launcher write block with a sequence of `>>` redirections (no parens block). Removed the `echo echo.` blank-line emissions. Escaped all parens inside if/else echoes as `^(` / `^)`. Reworded the top-level [INFO] message to avoid parens entirely.
+- Audit: grep confirms zero unescaped parens in indented echoes throughout the .bat.
+
 **Phase 1 follow-up round 3 (after third user test):**
 - Round 2's raw `StreamWriter` made things worse — monitor showed nothing at all. Root cause: spawning the monitor via `Start-Process -PassThru -NoNewWindow` from one PowerShell into another corrupts handle inheritance such that `[Console]::OpenStandardOutput()` doesn't connect to the visible console. Decision: stop trying to share the parent's console. Move the monitor to a **separate console window**.
 - [bin/epf_purge.bat](bin/epf_purge.bat) `start_monitor` — writes a small launcher .bat to `%TEMP%`, then spawns it via `Start-Process cmd` (no `-NoNewWindow`) which opens a new console window. The launcher runs the monitor and ends with `pause` so the window stays open after the monitor exits, letting the operator read the final output. Captures the cmd PID for cleanup.
@@ -130,9 +138,19 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 
 ---
 
-## Phase 2 — Affected-tables-only space comparison
+## Phase 2 — Affected-tables-only space comparison — **DONE**
 
 **Goal:** Replace the noisy full-tablespace dump with a focused per-module breakdown that matches the depth the user actually purged. Always show overall tablespace impact at the bottom.
+
+**Files changed:**
+- [sql/01_create_purge_log_table.sql](sql/01_create_purge_log_table.sql) — added `module VARCHAR2(20)` column to `epf_purge_space_snapshot` (in CREATE path + idempotent ALTER for existing installs)
+- [sql/03_epf_purge_pkg_body.sql](sql/03_epf_purge_pkg_body.sql) `ensure_log_table` — same idempotent ALTER for runs that bypass `01_*.sql`
+- [sql/03_epf_purge_pkg_body.sql](sql/03_epf_purge_pkg_body.sql) `capture_space_snapshot` — INSERT now computes `module` per row via a CASE on `parent_table` (PAYMENTS / LOGS / BANK_STATEMENTS / OTHER). Same CASE used in both DBA and user_segments fallback paths. ALSO captures `op.spec_trt_log` explicitly when not already in the OPPAYMENTS-tablespace snapshot, regardless of which tablespace it lives in.
+- [sql/03_epf_purge_pkg_body.sql](sql/03_epf_purge_pkg_body.sql) `print_space_comparison` — new signature `(p_run_id, p_depth DEFAULT ALL)`. Iterates a hardcoded master list of all 27 tables in module order (PAYMENTS → LOGS → BANK_STATEMENTS), alphabetised inside each. Shows only modules covered by `p_depth`. Prints per-module subtotal, then PURGED TABLES TOTAL (sum of shown modules), then TABLESPACE TOTAL (every captured row including OTHER). Tables with zero size still appear with 0.00 / 0.00 / 0.0%.
+- [sql/02_epf_purge_pkg_spec.sql](sql/02_epf_purge_pkg_spec.sql) — updated procedure signature to match
+- [sql/09_space_compare.sql](sql/09_space_compare.sql) — accepts `DEFINE depth` (default ALL) and passes it to the procedure
+- [bin/epf_purge.sh](bin/epf_purge.sh) `capture_space_comparison` — heredoc switched from single-quoted to double-quoted form so `${PURGE_DEPTH}` is interpolated; passed as second arg to `print_space_comparison`
+- [bin/epf_purge.bat](bin/epf_purge.bat) `capture_space_comparison` — writes a tiny temp .sql that does `DEFINE depth = %PURGE_DEPTH%` then includes `09_space_compare.sql`
 
 ### Changes
 
@@ -199,7 +217,24 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 
 ---
 
-## Phase 3 — Auto-show sizes integrated into depth prompt
+## Phase 3 — Auto-show sizes integrated into depth prompt — **DONE**
+
+**Goal:** Drop `--show-sizes` as a manual step. Always compute module sizes before the depth prompt and embed them inline. Also recommend `--max-iterations` based on tablespace size.
+
+**Files changed:**
+- new [sql/12_capture_module_sizes.sql](sql/12_capture_module_sizes.sql) — emits a single pipe-delimited line: `EPF_SIZES|PAYMENTS_GB|LOGS_GB|BANK_STATEMENTS_GB|TOTAL_GB|DATAFILE_GB`. Uses dba_segments (with op.spec_trt_log explicit inclusion) when granted, falls back to user_segments. Same module CASE logic as `capture_space_snapshot`.
+- [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — converted hardcoded `DEFINE target_pct_free / max_iterations / skip_stall_checks` defaults to `&1 / &2 / &3` positional bindings. **Pre-existing bug fix:** previously the hardcoded DEFINEs silently overrode any wrapper-pre-DEFINE, so `--no-stall-check` and (had it existed) `--max-iterations` were ineffective. Wrappers now pass values positionally.
+- [bin/epf_purge.sh](bin/epf_purge.sh) — added `MAX_ITERATIONS=`, `EPF_PAY_GB`, `EPF_LOG_GB`, `EPF_BST_GB`, `EPF_TOTAL_GB`, `EPF_DATAFILE_GB`, `EPF_RECOMMENDED_MAX_ITER` initialized at top. Added `--max-iterations N` arg + `MAX_ITERATIONS` config key. Added `capture_module_sizes` and `compute_recommended_max_iter` helpers. `interactive_prompts`: dropped the SHOW_SIZES Y/N prompt + show block; auto-captures sizes after password collected; depth prompt now formats sizes inline with `printf "%6.2f"`. New "Max Squeeze Iterations" prompt inside the reclaim block, defaulting to recommended value. `main()` auto-captures sizes for non-interactive runs too (for the max-iter recommendation). `--show-sizes` becomes a no-op with deprecation warning. `execute_reclaim_online` invokes `05_reclaim_tablespace.sql` with positional args.
+- [bin/epf_purge.bat](bin/epf_purge.bat) — mirror of all above. Added `:capture_module_sizes` and `:compute_recommended_max_iter` subroutines (cmd has no float math, so the recommendation strips the decimal portion of `EPF_DATAFILE_GB` — slight under-estimate, harmless). Fixed both `--reclaim-only` short-circuit and main reclaim block to invoke `05_reclaim_tablespace.sql` with positional args.
+- [config/epf_purge.conf.example](config/epf_purge.conf.example) — added `MAX_ITERATIONS=` config key with explanation.
+- `--help` text updated in both wrappers to document `--max-iterations` and the deprecation of `--show-sizes`.
+
+**Implementation notes:**
+- The "Tablespace Datafile" size used for the max-iter recommendation comes from `dba_data_files` (DBA grant required). When DBA views are not accessible, the recommendation falls back to 2000.
+- The bash wrapper formats GB values with `printf "%6.2f"` for clean alignment in the depth prompt. The .bat wrapper emits raw values (cmd has no printf) — slight visual misalignment, still readable.
+- The `op.spec_trt_log` table is included in the LOGS module total even if it lives in a different tablespace than OPPAYMENTS' default — matching the snapshot capture logic.
+
+**Phase 3 — Auto-show sizes integrated into depth prompt (original spec)**
 
 **Goal:** Drop `--show-sizes` as a manual step. Always compute module sizes before the depth prompt and embed them inline.
 
@@ -251,7 +286,27 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 
 ---
 
-## Phase 4 — Polish
+## Phase 4 — Polish — **DONE**
+
+**Goal:** Small UX/reliability improvements that don't fit the other phases.
+
+**Files changed:**
+- [bin/epf_purge.sh](bin/epf_purge.sh) and [bin/epf_purge.bat](bin/epf_purge.bat) — Configuration Summary regrouped into `[Connection]` / `[Purge]` / `[Maintenance]` blocks for readability.
+- [sql/03_epf_purge_pkg_body.sql](sql/03_epf_purge_pkg_body.sql) `run_purge` — removed the duplicate "EPF DATA PURGE" header banner. The wrapper already prints a Configuration Summary and the live monitor surfaces RUN_START with the same metadata.
+- [bin/epf_purge.sh](bin/epf_purge.sh) `load_config` — added `EPF_SYS_PASSWORD` env var support (parallel to `EPF_PURGE_PASSWORD`), so unattended runs with `--reclaim`/`--optimize-db` don't need an interactive prompt.
+- [bin/epf_purge.bat](bin/epf_purge.bat) — same `EPF_SYS_PASSWORD` support.
+- Both wrappers' `--help` text — documents the new env var.
+- [bin/epf_purge.sh](bin/epf_purge.sh) `capture_space_comparison`:
+  - Pre-comparison: queries the latest `RECLAIM_END` row. Prints a boxed `[WARN]` banner if status was `ERROR`, or if no `RECLAIM_END` row exists when `--reclaim` was requested. Comparison still runs.
+  - Post-comparison: queries for the latest `SQUEEZE_PROGRESS WARNING` row matching the "max iterations reached" or "consecutive zero-progress" patterns. If found, prints a boxed `[WARN]` banner with a ready-to-paste `--reclaim-only --max-iterations <2x>` re-run command (capped at 20000).
+- [bin/epf_purge.bat](bin/epf_purge.bat) — mirrors both banners. Uses temp .sql files + `findstr`-style result parsing (cmd has no heredoc capture).
+
+**Implementation notes:**
+- Both banners use the existing `[WARN]` log helpers, so they go to both stdout and the log file.
+- The `--reclaim-only` re-run command in the banner is constructed from the actual `TNS_NAME` / `USERNAME` of the current run, with the SYS password redacted as `<sys-pw>` placeholder for the operator to fill in (or supply via `EPF_SYS_PASSWORD` env var, which is now documented).
+- The "20000 iteration cap" is enforced both in the recommendation (`compute_recommended_max_iter`) and in the post-fail banner suggestion, matching the cap baked into the `compute_recommended_max_iter` heuristic.
+
+**Phase 4 — Polish (original spec)**
 
 **Goal:** Small UX/reliability improvements that don't fit the other phases.
 

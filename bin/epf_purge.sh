@@ -43,8 +43,17 @@ ASSUME_YES="N"
 DROP_PACKAGE_AFTER="N"
 DROP_LOGS="N"
 TRUNCATE_LOGS="N"
-SHOW_SIZES="N"
+SHOW_SIZES="N"     # deprecated: sizes are now shown automatically
+MAX_ITERATIONS=""  # empty = use recommendation based on tablespace size
 CONFIG_FILE=""
+
+# Auto-computed module sizes (populated by capture_module_sizes once DB is reachable)
+EPF_PAY_GB=""
+EPF_LOG_GB=""
+EPF_BST_GB=""
+EPF_TOTAL_GB=""
+EPF_DATAFILE_GB=""
+EPF_RECOMMENDED_MAX_ITER=""
 
 # ============================================================================
 # Color output helpers
@@ -88,7 +97,12 @@ parse_args() {
             --drop-pkg)     DROP_PACKAGE_AFTER="Y"; shift ;;
             --drop-logs)    DROP_LOGS="Y"; shift ;;
             --truncate-logs) TRUNCATE_LOGS="Y"; shift ;;
-            --show-sizes)   SHOW_SIZES="Y"; shift ;;
+            --show-sizes)
+                # Deprecated: module sizes are now always shown in the depth
+                # prompt and configuration summary. Flag accepted for back-
+                # compat; emits a one-time deprecation note later.
+                SHOW_SIZES="Y"; shift ;;
+            --max-iterations) MAX_ITERATIONS="$2"; shift 2 ;;
             --help|-h)      show_help; exit 0 ;;
             *)              log_error "Unknown argument: $1"; show_help; exit 1 ;;
         esac
@@ -122,13 +136,19 @@ load_config() {
                 RECLAIM_SPACE)      RECLAIM_SPACE="$value" ;;
                 SKIP_STALL_CHECKS)  SKIP_STALL_CHECKS="$value" ;;
                 DROP_PACKAGE_AFTER) DROP_PACKAGE_AFTER="$value" ;;
+                MAX_ITERATIONS)     MAX_ITERATIONS="$value" ;;
             esac
         done < "$CONFIG_FILE"
     fi
 
-    # Environment variable overrides config file for password
+    # Environment variable overrides config file for passwords
     if [[ -n "${EPF_PURGE_PASSWORD:-}" ]]; then
         PASSWORD="$EPF_PURGE_PASSWORD"
+    fi
+    # Parallel env var for SYS / DBA password so unattended runs that need
+    # --reclaim or --optimize-db don't have to type the password interactively.
+    if [[ -n "${EPF_SYS_PASSWORD:-}" ]]; then
+        SYS_PASSWORD="$EPF_SYS_PASSWORD"
     fi
 }
 
@@ -157,15 +177,21 @@ Options:
   --reclaim         After purge, run online space reclaim (SHRINK + squeeze + resize)
                     No downtime required. Needs DBA/SYS creds.
   --reclaim-only    Skip purge entirely, run online reclaim only
+  --max-iterations N Reclaim squeeze cap. Default = max(2000, 50*datafile_gb),
+                    capped at 20000. Wrapper recommends a value based on the
+                    OPPAYMENTS tablespace datafile size queried at startup.
   --no-stall-check  Disable stall detection during reclaim (always run all iterations)
   --drop-pkg        Drop the PL/SQL package after execution
   --drop-logs       Drop purge log tables (epf_purge_log, epf_purge_space_snapshot)
   --truncate-logs   Clear all purge run history before starting (keeps tables)
-  --show-sizes      Show data sizes per module to help choose purge depth
+  --show-sizes      DEPRECATED: module sizes are now always shown automatically.
+                    Flag accepted for back-compat; does nothing.
   --help, -h        Show this help message
 
 Environment Variables:
   EPF_PURGE_PASSWORD   Database password (overrides config file and --password)
+  EPF_SYS_PASSWORD     SYS / DBA password (overrides config file and --sys-password).
+                       Use this for unattended runs with --reclaim or --optimize-db.
 
 Examples:
   # Interactive mode (prompts for all inputs)
@@ -183,6 +209,39 @@ Examples:
   # Reclaim only (after a previous purge)
   ./epf_purge.sh --tns EPFPROD --reclaim-only --sys-password XXX
 HELPEOF
+}
+
+# ============================================================================
+# Capture module sizes (DB connectivity required)
+# ============================================================================
+# Populates EPF_PAY_GB / EPF_LOG_GB / EPF_BST_GB / EPF_TOTAL_GB / EPF_DATAFILE_GB
+# from sql/12_capture_module_sizes.sql. Silent on failure -- callers should
+# check whether EPF_TOTAL_GB ended up set before formatting size hints.
+capture_module_sizes() {
+    [[ -z "$TNS_NAME" || -z "$PASSWORD" ]] && return 1
+    local out
+    out=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" \
+              @"${SQL_DIR}/12_capture_module_sizes.sql" 2>/dev/null \
+              | grep '^EPF_SIZES|' | head -1)
+    [[ -z "$out" ]] && return 1
+    IFS='|' read -r _ EPF_PAY_GB EPF_LOG_GB EPF_BST_GB EPF_TOTAL_GB EPF_DATAFILE_GB <<< "$out"
+    return 0
+}
+
+# Recommend a max-iter value based on tablespace datafile size.
+# Heuristic: max(2000, 50 * datafile_gb), capped at 20000.
+# Falls back to 2000 if datafile size is unknown (no DBA grants).
+compute_recommended_max_iter() {
+    if [[ -z "$EPF_DATAFILE_GB" ]] || [[ "$EPF_DATAFILE_GB" == "0" ]] || [[ "$EPF_DATAFILE_GB" == "0.00" ]]; then
+        EPF_RECOMMENDED_MAX_ITER=2000
+        return
+    fi
+    local df_int
+    df_int=$(printf '%.0f' "$EPF_DATAFILE_GB")
+    local rec=$(( 50 * df_int ))
+    (( rec < 2000  )) && rec=2000
+    (( rec > 20000 )) && rec=20000
+    EPF_RECOMMENDED_MAX_ITER=$rec
 }
 
 # ============================================================================
@@ -214,26 +273,32 @@ interactive_prompts() {
     read -rp "  Retention days [$RETENTION_DAYS]: " input
     RETENTION_DAYS="${input:-$RETENTION_DAYS}"
 
+    # Auto-capture module sizes for the depth prompt + max-iter recommendation.
+    # Silent on failure; falls back to depth prompt without size hints.
     echo ""
-    echo "  Show Module Data Sizes (--show-sizes)"
-    echo "  Queries the database to show data sizes per purge module"
-    echo "  to help you choose the appropriate purge depth."
-    read -rp "  Show data sizes? (Y/N) [$SHOW_SIZES]: " input
-    SHOW_SIZES="${input:-$SHOW_SIZES}"
-
-    if [[ "${SHOW_SIZES^^}" == "Y" ]]; then
-        echo ""
-        echo "  [INFO]  Querying data sizes..."
-        sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" @"${SQL_DIR}/11_show_module_sizes.sql" 2>/dev/null
+    echo "  [INFO]  Querying current data sizes..."
+    if capture_module_sizes; then
+        compute_recommended_max_iter
+        log_ok "Sizes: PAYMENTS=${EPF_PAY_GB}GB  LOGS=${EPF_LOG_GB}GB  BANK_STATEMENTS=${EPF_BST_GB}GB  TOTAL=${EPF_TOTAL_GB}GB  TS-Datafile=${EPF_DATAFILE_GB}GB"
+    else
+        log_warn "Could not query data sizes -- depth prompt will not show GB hints."
+        compute_recommended_max_iter
     fi
 
     echo ""
     echo "  Purge Depth"
     echo "  Controls which data modules are purged:"
-    echo "    ALL             - Purge all modules (payments, logs, bank statements)"
-    echo "    PAYMENTS        - Purge bulk payments and file integrations only"
-    echo "    LOGS            - Purge audit trails and technical logs only"
-    echo "    BANK_STATEMENTS - Purge bank statement dispatching only"
+    if [[ -n "$EPF_TOTAL_GB" ]]; then
+        printf "    %-16s [~%6.2f GB]  %s\n" "ALL"             "$EPF_TOTAL_GB" "Purge all modules (payments, logs, bank statements)"
+        printf "    %-16s [~%6.2f GB]  %s\n" "PAYMENTS"        "$EPF_PAY_GB"   "Purge bulk payments and file integrations only"
+        printf "    %-16s [~%6.2f GB]  %s\n" "LOGS"            "$EPF_LOG_GB"   "Purge audit trails and technical logs only"
+        printf "    %-16s [~%6.2f GB]  %s\n" "BANK_STATEMENTS" "$EPF_BST_GB"   "Purge bank statement dispatching only"
+    else
+        echo "    ALL             - Purge all modules (payments, logs, bank statements)"
+        echo "    PAYMENTS        - Purge bulk payments and file integrations only"
+        echo "    LOGS            - Purge audit trails and technical logs only"
+        echo "    BANK_STATEMENTS - Purge bank statement dispatching only"
+    fi
     read -rp "  Purge depth [$PURGE_DEPTH]: " input
     PURGE_DEPTH="${input:-$PURGE_DEPTH}"
 
@@ -284,8 +349,21 @@ interactive_prompts() {
 
     if [[ "${RECLAIM_SPACE^^}" == "Y" ]]; then
         echo ""
+        echo "  Max Squeeze Iterations (--max-iterations)"
+        echo "  Each squeeze iteration relocates ONE segment near the high water"
+        echo "  mark. Larger tablespaces typically need more iterations."
+        if [[ -n "$EPF_DATAFILE_GB" ]] && (( $(printf '%.0f' "$EPF_DATAFILE_GB") > 0 )); then
+            echo "  Tablespace datafile: ${EPF_DATAFILE_GB} GB  ->  recommended: ${EPF_RECOMMENDED_MAX_ITER} iterations"
+        else
+            echo "  Tablespace size unknown (no DBA grants); defaulting to ${EPF_RECOMMENDED_MAX_ITER}."
+        fi
+        local default_max="${MAX_ITERATIONS:-$EPF_RECOMMENDED_MAX_ITER}"
+        read -rp "  Max iterations [$default_max]: " input
+        MAX_ITERATIONS="${input:-$default_max}"
+
+        echo ""
         echo "  Skip Stall Checks (--no-stall-check)"
-        echo "  When enabled, reclaim always runs all 2000 iterations without"
+        echo "  When enabled, reclaim always runs all max iterations without"
         echo "  stopping early on zero-progress checkpoints."
         read -rp "  Skip stall checks? (Y/N) [$SKIP_STALL_CHECKS]: " input
         SKIP_STALL_CHECKS="${input:-$SKIP_STALL_CHECKS}"
@@ -700,7 +778,51 @@ capture_space_comparison() {
 
     log_info "Capturing post-reclaim space snapshot and comparison..."
 
-    sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'SQLEOF' 2>&1 | tee -a "$LOG_FILE"
+    # If --reclaim was requested, check whether RECLAIM_END landed and with
+    # what status. Drives the WARN banner before the table and the
+    # "max-iter exhausted" recommendation banner after.
+    local reclaim_end_status=""
+    local reclaim_end_msg=""
+    if [[ "${RECLAIM_SPACE^^}" == "Y" ]]; then
+        local probe
+        probe=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'SQLEOF' 2>/dev/null | tr -d '\r'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 4000 TRIMSPOOL ON
+SELECT NVL(status, 'MISSING') || '|' || NVL(REPLACE(message, CHR(10), ' '), '')
+FROM (
+    SELECT status, message FROM oppayments.epf_purge_log
+    WHERE operation = 'RECLAIM_END'
+    ORDER BY log_timestamp DESC
+) WHERE ROWNUM = 1;
+EXIT;
+SQLEOF
+        )
+        reclaim_end_status="${probe%%|*}"
+        reclaim_end_status=$(echo "$reclaim_end_status" | xargs)
+        reclaim_end_msg="${probe#*|}"
+        reclaim_end_msg=$(echo "$reclaim_end_msg" | xargs)
+
+        if [[ -z "$reclaim_end_status" || "$reclaim_end_status" == "MISSING" ]]; then
+            echo "" | tee -a "$LOG_FILE"
+            log_warn "============================================================"
+            log_warn "  WARNING: Reclaim was requested but no RECLAIM_END row was"
+            log_warn "  found in epf_purge_log. The reclaim may not have run, or"
+            log_warn "  it may have been killed before completion. The AFTER"
+            log_warn "  snapshot below may not reflect the intended final state."
+            log_warn "  See logs/epf_purge_*.log for details."
+            log_warn "============================================================"
+        elif [[ "$reclaim_end_status" == "ERROR" ]]; then
+            echo "" | tee -a "$LOG_FILE"
+            log_warn "============================================================"
+            log_warn "  WARNING: Reclaim ended with status=ERROR. The AFTER"
+            log_warn "  snapshot below may not reflect the intended final state."
+            log_warn "  Reclaim message: ${reclaim_end_msg}"
+            log_warn "============================================================"
+        fi
+    fi
+
+    # Pass the depth used for THIS run so the comparison only shows relevant
+    # modules. Heredoc uses double-quoted form so $PURGE_DEPTH is expanded.
+    sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<SQLEOF 2>&1 | tee -a "$LOG_FILE"
 SET SERVEROUTPUT ON SIZE UNLIMITED
 SET LINESIZE 200
 SET HEADING OFF FEEDBACK OFF
@@ -718,11 +840,52 @@ BEGIN
     COMMIT;
     -- Capture fresh AFTER snapshot (post-reclaim segment sizes)
     oppayments.epf_purge_pkg.capture_space_snapshot(l_run_id, 'AFTER');
-    oppayments.epf_purge_pkg.print_space_comparison(l_run_id);
+    oppayments.epf_purge_pkg.print_space_comparison(l_run_id, '${PURGE_DEPTH}');
 END;
 /
 EXIT;
 SQLEOF
+
+    # ----------------------------------------------------------------------
+    # Post-reclaim "max iterations exhausted" recommendation banner.
+    # The squeeze loop in 05_reclaim_tablespace.sql writes a SQUEEZE_PROGRESS
+    # WARNING row when it exits because (a) max iterations were hit, or
+    # (b) the stall guard fired. If we see either, suggest a re-run with a
+    # larger --max-iterations.
+    # ----------------------------------------------------------------------
+    if [[ "${RECLAIM_SPACE^^}" == "Y" ]]; then
+        local hit
+        hit=$(sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" <<'SQLEOF' 2>/dev/null | tr -d '\r'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 4000 TRIMSPOOL ON
+SELECT message FROM (
+    SELECT message FROM oppayments.epf_purge_log
+    WHERE operation = 'SQUEEZE_PROGRESS'
+      AND status = 'WARNING'
+      AND (message LIKE 'Squeeze stopped: max iterations%'
+           OR message LIKE 'Squeeze stopped: % consecutive zero-progress%')
+    ORDER BY log_timestamp DESC
+) WHERE ROWNUM = 1;
+EXIT;
+SQLEOF
+        )
+        hit=$(echo "$hit" | xargs)
+        if [[ -n "$hit" ]]; then
+            local current_max="${MAX_ITERATIONS:-${EPF_RECOMMENDED_MAX_ITER:-2000}}"
+            local suggested=$(( current_max * 2 ))
+            (( suggested > 20000 )) && suggested=20000
+            echo "" | tee -a "$LOG_FILE"
+            log_warn "============================================================"
+            log_warn "  RECLAIM DID NOT REACH TARGET HWM"
+            log_warn "  ${hit}"
+            log_warn "  --"
+            log_warn "  To squeeze further, re-run reclaim with a larger cap:"
+            log_warn "    bin/epf_purge.sh --tns ${TNS_NAME} --user ${USERNAME} \\"
+            log_warn "      --reclaim-only --sys-password '<sys-pw>' \\"
+            log_warn "      --max-iterations ${suggested}"
+            log_warn "  (Current run used max_iterations=${current_max}.)"
+            log_warn "============================================================"
+        fi
+    fi
 }
 
 # ============================================================================
@@ -812,9 +975,11 @@ execute_reclaim_online() {
         sys_connect="${SYS_USER}/${SYS_PASSWORD}@${TNS_NAME}"
     fi
 
+    # Positional args: target_pct_free, max_iterations, skip_stall_checks
+    local effective_max_iter="${MAX_ITERATIONS:-${EPF_RECOMMENDED_MAX_ITER:-2000}}"
+    log_info "Reclaim parameters: target_pct_free=10, max_iterations=${effective_max_iter}, skip_stall_checks=${SKIP_STALL_CHECKS}"
     sqlplus -S "${sys_connect}" <<SQLEOF 2>&1 | tee -a "$LOG_FILE"
-DEFINE skip_stall_checks = ${SKIP_STALL_CHECKS}
-@${SQL_DIR}/05_reclaim_tablespace.sql
+@${SQL_DIR}/05_reclaim_tablespace.sql 10 ${effective_max_iter} ${SKIP_STALL_CHECKS}
 EXIT;
 SQLEOF
     local sqlplus_exit=${PIPESTATUS[0]}
@@ -869,22 +1034,26 @@ main() {
         interactive_prompts
     fi
 
-    # Confirm settings
+    # Confirm settings (grouped for readability)
     log_header "Configuration Summary"
-    log_info "TNS Name:       $TNS_NAME"
-    log_info "Username:       $USERNAME"
-    log_info "Retention:      $RETENTION_DAYS days"
-    log_info "Purge Depth:    $PURGE_DEPTH"
-    log_info "Batch Size:     $BATCH_SIZE"
-    log_info "Dry Run:        $DRY_RUN"
-    log_info "Optimize DB:    $OPTIMIZE_DB"
-    log_info "Reclaim Space:  $RECLAIM_SPACE"
+    log_info "[Connection]"
+    log_info "  TNS Name:       $TNS_NAME"
+    log_info "  Username:       $USERNAME"
+    log_info "[Purge]"
+    log_info "  Retention:      $RETENTION_DAYS days"
+    log_info "  Depth:          $PURGE_DEPTH"
+    log_info "  Batch Size:     $BATCH_SIZE"
+    log_info "  Dry Run:        $DRY_RUN"
+    log_info "[Maintenance]"
+    log_info "  Optimize DB:    $OPTIMIZE_DB"
+    log_info "  Reclaim Space:  $RECLAIM_SPACE"
     if [[ "${RECLAIM_SPACE^^}" == "Y" ]]; then
-        log_info "Skip Stall:     $SKIP_STALL_CHECKS"
+        log_info "  Max Iterations: ${MAX_ITERATIONS:-${EPF_RECOMMENDED_MAX_ITER:-2000}}"
+        log_info "  Skip Stall:     $SKIP_STALL_CHECKS"
     fi
-    log_info "Drop Package:   $DROP_PACKAGE_AFTER"
-    log_info "Truncate Logs:  $TRUNCATE_LOGS"
-    log_info "Drop Logs:      $DROP_LOGS"
+    log_info "  Drop Package:   $DROP_PACKAGE_AFTER"
+    log_info "  Truncate Logs:  $TRUNCATE_LOGS"
+    log_info "  Drop Logs:      $DROP_LOGS"
 
     # Disk space estimate
     echo "" | tee -a "$LOG_FILE"
@@ -905,11 +1074,22 @@ main() {
     # Execute steps
     check_prerequisites
 
-    # Show module sizes if requested (non-interactive only; interactive already handled in prompts)
-    if [[ "${SHOW_SIZES^^}" == "Y" && "$_was_interactive" != "Y" ]]; then
-        echo ""
-        log_info "Querying data sizes per module..."
-        sqlplus -S "${USERNAME}/${PASSWORD}@${TNS_NAME}" @"${SQL_DIR}/11_show_module_sizes.sql" 2>/dev/null
+    # Auto-capture sizes for non-interactive runs (interactive_prompts already
+    # did this). Used for the max-iter recommendation in execute_reclaim_online
+    # and matches the data the operator would have seen interactively.
+    if [[ "$_was_interactive" != "Y" && -z "$EPF_TOTAL_GB" ]]; then
+        if capture_module_sizes; then
+            compute_recommended_max_iter
+            log_info "Sizes: PAYMENTS=${EPF_PAY_GB}GB  LOGS=${EPF_LOG_GB}GB  BANK_STATEMENTS=${EPF_BST_GB}GB  TOTAL=${EPF_TOTAL_GB}GB  TS-Datafile=${EPF_DATAFILE_GB}GB"
+            if [[ "${RECLAIM_SPACE^^}" == "Y" && -z "$MAX_ITERATIONS" ]]; then
+                log_info "Recommended max_iterations for ${EPF_DATAFILE_GB}GB tablespace: $EPF_RECOMMENDED_MAX_ITER"
+            fi
+        fi
+    fi
+
+    # --show-sizes is deprecated -- sizes are always captured + shown above
+    if [[ "${SHOW_SIZES^^}" == "Y" ]]; then
+        log_warn "--show-sizes is deprecated; sizes are now always shown automatically. Flag accepted but does nothing."
     fi
 
     # --optimize-db: enlarge redo logs + gather stats (needs SYS)

@@ -46,7 +46,16 @@ set "DROP_PACKAGE_AFTER=N"
 set "DROP_LOGS=N"
 set "TRUNCATE_LOGS=N"
 set "SHOW_SIZES=N"
+set "MAX_ITERATIONS="
 set "CONFIG_FILE="
+
+REM Auto-computed module sizes (populated by capture_module_sizes once DB is reachable)
+set "EPF_PAY_GB="
+set "EPF_LOG_GB="
+set "EPF_BST_GB="
+set "EPF_TOTAL_GB="
+set "EPF_DATAFILE_GB="
+set "EPF_RECOMMENDED_MAX_ITER=2000"
 
 REM Ensure log directory exists
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
@@ -80,6 +89,7 @@ if /i "%~1"=="--drop-pkg"   ( set "DROP_PACKAGE_AFTER=Y" & shift & goto :parse_a
 if /i "%~1"=="--drop-logs"  ( set "DROP_LOGS=Y" & shift & goto :parse_args )
 if /i "%~1"=="--truncate-logs" ( set "TRUNCATE_LOGS=Y" & shift & goto :parse_args )
 if /i "%~1"=="--show-sizes" ( set "SHOW_SIZES=Y" & shift & goto :parse_args )
+if /i "%~1"=="--max-iterations" ( set "MAX_ITERATIONS=%~2" & shift & shift & goto :parse_args )
 if /i "%~1"=="--help"       ( goto :show_help )
 if /i "%~1"=="-h"           ( goto :show_help )
 echo [ERROR] Unknown argument: %~1
@@ -100,8 +110,11 @@ if not "%CONFIG_FILE%"=="" (
     )
 )
 
-REM Environment variable overrides for password
+REM Environment variable overrides for passwords
 if defined EPF_PURGE_PASSWORD set "PASSWORD=%EPF_PURGE_PASSWORD%"
+REM Parallel env var for SYS / DBA password so unattended runs that need
+REM --reclaim or --optimize-db don't have to type the password interactively.
+if defined EPF_SYS_PASSWORD set "SYS_PASSWORD=%EPF_SYS_PASSWORD%"
 
 REM ============================================================================
 REM --reclaim-only short-circuit: skip purge entirely, run online reclaim only
@@ -118,9 +131,10 @@ if /i "%RECLAIM_ONLY%"=="Y" (
         for /f "usebackq delims=" %%P in (`powershell -Command "$p = Read-Host '  SYS password' -AsSecureString; [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($p))"`) do set "SYS_PASSWORD=%%P"
     )
     echo [INFO]  Skipping purge. Running online reclaim only.
-    echo DEFINE skip_stall_checks = !SKIP_STALL_CHECKS!> "%TEMP%\epf_reclaim_online.sql"
-    echo @"%SQL_DIR%\05_reclaim_tablespace.sql">> "%TEMP%\epf_reclaim_online.sql"
-    echo EXIT;>> "%TEMP%\epf_reclaim_online.sql"
+    if "!MAX_ITERATIONS!"=="" set "MAX_ITERATIONS=2000"
+    REM Positional args: target_pct_free, max_iterations, skip_stall_checks
+    > "%TEMP%\epf_reclaim_online.sql" echo @"%SQL_DIR%\05_reclaim_tablespace.sql" 10 !MAX_ITERATIONS! !SKIP_STALL_CHECKS!
+    >> "%TEMP%\epf_reclaim_online.sql" echo EXIT;
     powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S 'sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA' '@%TEMP%\epf_reclaim_online.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
     del "%TEMP%\epf_reclaim_online.sql" >nul 2>&1
     echo [OK]    Online reclaim completed. Log: %LOG_FILE%
@@ -163,26 +177,32 @@ if /i "%INTERACTIVE%"=="Y" (
     set /p "RETENTION_INPUT=  Retention days [!RETENTION_DAYS!]: "
     if not "!RETENTION_INPUT!"=="" set "RETENTION_DAYS=!RETENTION_INPUT!"
 
+    REM Auto-capture module sizes for depth prompt + max-iter recommendation.
+    REM Silent on failure -- depth prompt falls back to no GB hints.
     echo.
-    echo   Show Module Data Sizes ^(--show-sizes^)
-    echo   Queries the database to show data sizes per purge module
-    echo   to help you choose the appropriate purge depth.
-    set /p "SIZES_INPUT=  Show data sizes? (Y/N) [!SHOW_SIZES!]: "
-    if not "!SIZES_INPUT!"=="" set "SHOW_SIZES=!SIZES_INPUT!"
-
-    if /i "!SHOW_SIZES!"=="Y" (
-        echo.
-        echo [INFO]  Querying data sizes per module...
-        sqlplus -S "!USERNAME!/!PASSWORD!@!TNS_NAME!" @"%SQL_DIR%\11_show_module_sizes.sql" 2>nul
+    echo [INFO]  Querying current data sizes...
+    call :capture_module_sizes
+    call :compute_recommended_max_iter
+    if defined EPF_TOTAL_GB (
+        call :log "[OK]    Sizes: PAYMENTS=!EPF_PAY_GB!GB  LOGS=!EPF_LOG_GB!GB  BANK_STATEMENTS=!EPF_BST_GB!GB  TOTAL=!EPF_TOTAL_GB!GB  TS-Datafile=!EPF_DATAFILE_GB!GB"
+    ) else (
+        echo [WARN]  Could not query data sizes -- depth prompt will not show GB hints.
     )
 
     echo.
     echo   Purge Depth
     echo   Controls which data modules are purged:
-    echo     ALL             - Purge all modules ^(payments, logs, bank statements^)
-    echo     PAYMENTS        - Purge bulk payments and file integrations only
-    echo     LOGS            - Purge audit trails and technical logs only
-    echo     BANK_STATEMENTS - Purge bank statement dispatching only
+    if defined EPF_TOTAL_GB (
+        echo     ALL              [~!EPF_TOTAL_GB! GB]  Purge all modules ^(payments, logs, bank statements^)
+        echo     PAYMENTS         [~!EPF_PAY_GB! GB]   Purge bulk payments and file integrations only
+        echo     LOGS             [~!EPF_LOG_GB! GB]   Purge audit trails and technical logs only
+        echo     BANK_STATEMENTS  [~!EPF_BST_GB! GB]   Purge bank statement dispatching only
+    ) else (
+        echo     ALL             - Purge all modules ^(payments, logs, bank statements^)
+        echo     PAYMENTS        - Purge bulk payments and file integrations only
+        echo     LOGS            - Purge audit trails and technical logs only
+        echo     BANK_STATEMENTS - Purge bank statement dispatching only
+    )
     set /p "DEPTH_INPUT=  Purge depth [!PURGE_DEPTH!]: "
     if not "!DEPTH_INPUT!"=="" set "PURGE_DEPTH=!DEPTH_INPUT!"
 
@@ -233,8 +253,26 @@ if /i "%INTERACTIVE%"=="Y" (
 
     if /i "!RECLAIM_SPACE!"=="Y" (
         echo.
+        echo   Max Squeeze Iterations ^(--max-iterations^)
+        echo   Each squeeze iteration relocates ONE segment near the high water
+        echo   mark. Larger tablespaces typically need more iterations.
+        if defined EPF_DATAFILE_GB (
+            echo   Tablespace datafile: !EPF_DATAFILE_GB! GB  -^>  recommended: !EPF_RECOMMENDED_MAX_ITER! iterations
+        ) else (
+            echo   Tablespace size unknown ^(no DBA grants^); defaulting to !EPF_RECOMMENDED_MAX_ITER!.
+        )
+        set "DEFAULT_MAX=!MAX_ITERATIONS!"
+        if "!DEFAULT_MAX!"=="" set "DEFAULT_MAX=!EPF_RECOMMENDED_MAX_ITER!"
+        set /p "MAXITER_INPUT=  Max iterations [!DEFAULT_MAX!]: "
+        if "!MAXITER_INPUT!"=="" (
+            set "MAX_ITERATIONS=!DEFAULT_MAX!"
+        ) else (
+            set "MAX_ITERATIONS=!MAXITER_INPUT!"
+        )
+
+        echo.
         echo   Skip Stall Checks ^(--no-stall-check^)
-        echo   When enabled, reclaim always runs all 2000 iterations without
+        echo   When enabled, reclaim always runs all max iterations without
         echo   stopping early on zero-progress checkpoints.
         set /p "STALL_INPUT=  Skip stall checks? (Y/N) [!SKIP_STALL_CHECKS!]: "
         if not "!STALL_INPUT!"=="" set "SKIP_STALL_CHECKS=!STALL_INPUT!"
@@ -260,18 +298,27 @@ echo.
 echo   ============================================================
 echo   Configuration Summary
 echo   ============================================================
-echo   TNS Name:       %TNS_NAME%
-echo   Username:       %USERNAME%
-echo   Retention:      %RETENTION_DAYS% days
-echo   Purge Depth:    %PURGE_DEPTH%
-echo   Batch Size:     %BATCH_SIZE%
-echo   Dry Run:        %DRY_RUN%
-echo   Optimize DB:    %OPTIMIZE_DB%
-echo   Reclaim Space:  %RECLAIM_SPACE%
-if /i "%RECLAIM_SPACE%"=="Y" echo   Skip Stall:     %SKIP_STALL_CHECKS%
-echo   Drop Package:   %DROP_PACKAGE_AFTER%
-echo   Truncate Logs:  %TRUNCATE_LOGS%
-echo   Log File:       %LOG_FILE%
+echo   [Connection]
+echo     TNS Name:       %TNS_NAME%
+echo     Username:       %USERNAME%
+echo   [Purge]
+echo     Retention:      %RETENTION_DAYS% days
+echo     Depth:          %PURGE_DEPTH%
+echo     Batch Size:     %BATCH_SIZE%
+echo     Dry Run:        %DRY_RUN%
+echo   [Maintenance]
+echo     Optimize DB:    %OPTIMIZE_DB%
+echo     Reclaim Space:  %RECLAIM_SPACE%
+if /i "%RECLAIM_SPACE%"=="Y" (
+    if "!MAX_ITERATIONS!"=="" set "EFF_MAX=!EPF_RECOMMENDED_MAX_ITER!"
+    if "!MAX_ITERATIONS!" NEQ "" set "EFF_MAX=!MAX_ITERATIONS!"
+    if "!EFF_MAX!"=="" set "EFF_MAX=2000"
+    echo     Max Iterations: !EFF_MAX!
+    echo     Skip Stall:     !SKIP_STALL_CHECKS!
+)
+echo     Drop Package:   %DROP_PACKAGE_AFTER%
+echo     Truncate Logs:  %TRUNCATE_LOGS%
+echo     Log File:       %LOG_FILE%
 echo   ============================================================
 echo.
 echo   --- Approximate Disk Space Requirements ---
@@ -321,13 +368,25 @@ if %ERRORLEVEL% neq 0 (
 del "%TEMP%\epf_test.sql" "%TEMP%\epf_test_result.txt" >nul 2>&1
 call :log "[OK]    Database connection successful"
 
-REM Show module sizes if requested (non-interactive mode)
-if /i "%SHOW_SIZES%"=="Y" (
-    if /i not "%INTERACTIVE%"=="Y" (
-        echo.
-        echo [INFO]  Querying data sizes per module...
-        sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" @"%SQL_DIR%\11_show_module_sizes.sql" 2>nul
+REM Auto-capture sizes for non-interactive runs (interactive_prompts already
+REM did this). Used for the max-iter recommendation in the reclaim block and
+REM matches the data the operator would have seen interactively.
+if /i not "%INTERACTIVE%"=="Y" (
+    if not defined EPF_TOTAL_GB (
+        call :capture_module_sizes
+        call :compute_recommended_max_iter
+        if defined EPF_TOTAL_GB (
+            call :log "[INFO]  Sizes: PAYMENTS=!EPF_PAY_GB!GB  LOGS=!EPF_LOG_GB!GB  BANK_STATEMENTS=!EPF_BST_GB!GB  TOTAL=!EPF_TOTAL_GB!GB  TS-Datafile=!EPF_DATAFILE_GB!GB"
+            if /i "!RECLAIM_SPACE!"=="Y" if "!MAX_ITERATIONS!"=="" (
+                call :log "[INFO]  Recommended max_iterations for !EPF_DATAFILE_GB!GB tablespace: !EPF_RECOMMENDED_MAX_ITER!"
+            )
+        )
     )
+)
+
+REM --show-sizes is deprecated -- sizes are always captured + shown above
+if /i "%SHOW_SIZES%"=="Y" (
+    call :log "[WARN]  --show-sizes is deprecated; sizes are now always shown automatically. Flag accepted but does nothing."
 )
 
 REM ============================================================================
@@ -626,9 +685,12 @@ if /i "%RECLAIM_SPACE%"=="Y" (
         echo   ============================================================
         echo   Online Tablespace Reclaim ^(SHRINK + squeeze + resize^)
         echo   ============================================================
-        echo DEFINE skip_stall_checks = !SKIP_STALL_CHECKS!> "%TEMP%\epf_reclaim_online.sql"
-        echo @"%SQL_DIR%\05_reclaim_tablespace.sql">> "%TEMP%\epf_reclaim_online.sql"
-        echo EXIT;>> "%TEMP%\epf_reclaim_online.sql"
+        if "!MAX_ITERATIONS!"=="" set "MAX_ITERATIONS=!EPF_RECOMMENDED_MAX_ITER!"
+        if "!MAX_ITERATIONS!"=="" set "MAX_ITERATIONS=2000"
+        call :log "[INFO]  Reclaim parameters: target_pct_free=10, max_iterations=!MAX_ITERATIONS!, skip_stall_checks=!SKIP_STALL_CHECKS!"
+        REM Positional args: target_pct_free, max_iterations, skip_stall_checks
+        > "%TEMP%\epf_reclaim_online.sql" echo @"%SQL_DIR%\05_reclaim_tablespace.sql" 10 !MAX_ITERATIONS! !SKIP_STALL_CHECKS!
+        >> "%TEMP%\epf_reclaim_online.sql" echo EXIT;
         powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S 'sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA' '@%TEMP%\epf_reclaim_online.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
         del "%TEMP%\epf_reclaim_online.sql" >nul 2>&1
         powershell -Command "Start-Sleep -Seconds 15"
@@ -642,8 +704,81 @@ REM ============================================================================
 REM Space comparison is done here (after reclaim) instead of inside run_purge
 REM because DELETE alone does not change segment sizes - only SHRINK/MOVE does.
 if /i not "%DRY_RUN%"=="Y" (
+
+    REM ----- Pre-comparison reclaim status check (post-fail warning) -----
+    if /i "%RECLAIM_SPACE%"=="Y" (
+        > "%TEMP%\epf_reclaim_probe.sql" echo SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 4000 TRIMSPOOL ON
+        >> "%TEMP%\epf_reclaim_probe.sql" echo SELECT NVL(status, 'MISSING') ^|^| '^|' ^|^| NVL(REPLACE(message, CHR(10), ' '), '') FROM ^( SELECT status, message FROM oppayments.epf_purge_log WHERE operation = 'RECLAIM_END' ORDER BY log_timestamp DESC ^) WHERE ROWNUM = 1;
+        >> "%TEMP%\epf_reclaim_probe.sql" echo EXIT;
+        sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" @"%TEMP%\epf_reclaim_probe.sql" > "%TEMP%\epf_reclaim_probe.out" 2>nul
+        del "%TEMP%\epf_reclaim_probe.sql" >nul 2>&1
+        set "RECLAIM_END_LINE="
+        for /f "usebackq delims=" %%L in ("%TEMP%\epf_reclaim_probe.out") do (
+            if not "%%L"=="" set "RECLAIM_END_LINE=%%L"
+        )
+        del "%TEMP%\epf_reclaim_probe.out" >nul 2>&1
+        for /f "tokens=1,* delims=|" %%A in ("!RECLAIM_END_LINE!") do (
+            set "RECLAIM_END_STATUS=%%A"
+            set "RECLAIM_END_MSG=%%B"
+        )
+        if "!RECLAIM_END_STATUS!"=="" set "RECLAIM_END_STATUS=MISSING"
+        if /i "!RECLAIM_END_STATUS!"=="MISSING" (
+            echo.
+            call :log "[WARN]  ============================================================"
+            call :log "[WARN]    Reclaim was requested but no RECLAIM_END row was found in"
+            call :log "[WARN]    epf_purge_log. The reclaim may not have run, or it may"
+            call :log "[WARN]    have been killed. The AFTER snapshot below may not"
+            call :log "[WARN]    reflect the intended final state."
+            call :log "[WARN]  ============================================================"
+        ) else if /i "!RECLAIM_END_STATUS!"=="ERROR" (
+            echo.
+            call :log "[WARN]  ============================================================"
+            call :log "[WARN]    Reclaim ended with status=ERROR. AFTER snapshot may not"
+            call :log "[WARN]    reflect the intended final state."
+            call :log "[WARN]    Reclaim message: !RECLAIM_END_MSG!"
+            call :log "[WARN]  ============================================================"
+        )
+    )
+
     echo [INFO]  Capturing post-reclaim space snapshot and comparison...
-    powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S '%USERNAME%/%PASSWORD%@%TNS_NAME%' '@%SQL_DIR%\09_space_compare.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
+    REM Pass the actual purge depth via DEFINE so the report only lists
+    REM modules the user actually purged.
+    > "%TEMP%\epf_space_compare.sql" echo DEFINE depth = %PURGE_DEPTH%
+    >> "%TEMP%\epf_space_compare.sql" echo @"%SQL_DIR%\09_space_compare.sql"
+    powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S '%USERNAME%/%PASSWORD%@%TNS_NAME%' '@%TEMP%\epf_space_compare.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
+    del "%TEMP%\epf_space_compare.sql" >nul 2>&1
+
+    REM ----- Post-reclaim "max-iter exhausted" recommendation banner -----
+    if /i "%RECLAIM_SPACE%"=="Y" (
+        > "%TEMP%\epf_squeeze_probe.sql" echo SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 4000 TRIMSPOOL ON
+        >> "%TEMP%\epf_squeeze_probe.sql" echo SELECT message FROM ^( SELECT message FROM oppayments.epf_purge_log WHERE operation = 'SQUEEZE_PROGRESS' AND status = 'WARNING' AND ^(message LIKE 'Squeeze stopped: max iterations^%%' OR message LIKE 'Squeeze stopped: ^%% consecutive zero-progress^%%'^) ORDER BY log_timestamp DESC ^) WHERE ROWNUM = 1;
+        >> "%TEMP%\epf_squeeze_probe.sql" echo EXIT;
+        sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" @"%TEMP%\epf_squeeze_probe.sql" > "%TEMP%\epf_squeeze_probe.out" 2>nul
+        del "%TEMP%\epf_squeeze_probe.sql" >nul 2>&1
+        set "SQUEEZE_HIT="
+        for /f "usebackq delims=" %%L in ("%TEMP%\epf_squeeze_probe.out") do (
+            if not "%%L"=="" set "SQUEEZE_HIT=%%L"
+        )
+        del "%TEMP%\epf_squeeze_probe.out" >nul 2>&1
+        if not "!SQUEEZE_HIT!"=="" (
+            set "CURRENT_MAX=!MAX_ITERATIONS!"
+            if "!CURRENT_MAX!"=="" set "CURRENT_MAX=!EPF_RECOMMENDED_MAX_ITER!"
+            if "!CURRENT_MAX!"=="" set "CURRENT_MAX=2000"
+            set /a "SUGGESTED=CURRENT_MAX * 2"
+            if !SUGGESTED! GTR 20000 set "SUGGESTED=20000"
+            echo.
+            call :log "[WARN]  ============================================================"
+            call :log "[WARN]    RECLAIM DID NOT REACH TARGET HWM"
+            call :log "[WARN]    !SQUEEZE_HIT!"
+            call :log "[WARN]    --"
+            call :log "[WARN]    To squeeze further, re-run reclaim with a larger cap:"
+            call :log "[WARN]      bin\epf_purge.bat --tns %TNS_NAME% --user %USERNAME% ^^"
+            call :log "[WARN]        --reclaim-only --sys-password ^<sys-pw^> ^^"
+            call :log "[WARN]        --max-iterations !SUGGESTED!"
+            call :log "[WARN]    ^(Current run used max_iterations=!CURRENT_MAX!.^)"
+            call :log "[WARN]  ============================================================"
+        )
+    )
 )
 
 REM ============================================================================
@@ -706,6 +841,51 @@ echo(%~1
 exit /b 0
 
 REM ============================================================================
+REM Capture module sizes (DB connectivity required)
+REM ============================================================================
+REM Populates EPF_PAY_GB / EPF_LOG_GB / EPF_BST_GB / EPF_TOTAL_GB / EPF_DATAFILE_GB
+REM by parsing the EPF_SIZES| line emitted by sql/12_capture_module_sizes.sql.
+REM Silent on failure; callers should check whether EPF_TOTAL_GB ended up set.
+:capture_module_sizes
+if "%TNS_NAME%"=="" exit /b 1
+if "%PASSWORD%"=="" exit /b 1
+set "EPF_PAY_GB="
+set "EPF_LOG_GB="
+set "EPF_BST_GB="
+set "EPF_TOTAL_GB="
+set "EPF_DATAFILE_GB="
+sqlplus -S "%USERNAME%/%PASSWORD%@%TNS_NAME%" @"%SQL_DIR%\12_capture_module_sizes.sql" 2>nul > "%TEMP%\epf_sizes.out"
+for /f "tokens=1-6 delims=|" %%A in ('findstr /B "EPF_SIZES" "%TEMP%\epf_sizes.out" 2^>nul') do (
+    set "EPF_PAY_GB=%%B"
+    set "EPF_LOG_GB=%%C"
+    set "EPF_BST_GB=%%D"
+    set "EPF_TOTAL_GB=%%E"
+    set "EPF_DATAFILE_GB=%%F"
+)
+del "%TEMP%\epf_sizes.out" >nul 2>&1
+if not defined EPF_TOTAL_GB exit /b 1
+exit /b 0
+
+REM ============================================================================
+REM Compute recommended max iterations from datafile size
+REM ============================================================================
+REM Heuristic: max(2000, 50 * datafile_gb), capped at 20000.
+REM cmd has no float math, so we strip the decimal portion of EPF_DATAFILE_GB
+REM (a slight under-estimate, harmless).
+:compute_recommended_max_iter
+set "EPF_RECOMMENDED_MAX_ITER=2000"
+if not defined EPF_DATAFILE_GB exit /b 0
+if "!EPF_DATAFILE_GB!"=="0" exit /b 0
+if "!EPF_DATAFILE_GB!"=="0.00" exit /b 0
+for /f "tokens=1 delims=." %%A in ("!EPF_DATAFILE_GB!") do set "DF_INT=%%A"
+if "!DF_INT!"=="" exit /b 0
+set /a "REC=50 * DF_INT" 2>nul
+if !REC! LSS 2000 set "REC=2000"
+if !REC! GTR 20000 set "REC=20000"
+set "EPF_RECOMMENDED_MAX_ITER=!REC!"
+exit /b 0
+
+REM ============================================================================
 REM Help
 REM ============================================================================
 :show_help
@@ -730,15 +910,21 @@ echo                     Needs DBA/SYS creds. ~4 GB temp disk space. Idempotent.
 echo   --reclaim         After purge, run online space reclaim (SHRINK + squeeze + resize)
 echo                     No downtime required. Needs DBA/SYS creds.
 echo   --reclaim-only    Skip purge entirely, run online reclaim only
+echo   --max-iterations N Reclaim squeeze cap. Default = max(2000, 50*datafile_gb),
+echo                     capped at 20000. Wrapper recommends a value based on the
+echo                     OPPAYMENTS tablespace datafile size queried at startup.
 echo   --no-stall-check  Disable stall detection during reclaim (always run all iterations)
 echo   --drop-pkg        Drop the PL/SQL package after execution
 echo   --drop-logs       Drop purge log tables (epf_purge_log, epf_purge_space_snapshot)
 echo   --truncate-logs   Clear all purge run history before starting (keeps tables)
-echo   --show-sizes      Show data sizes per module to help choose purge depth
+echo   --show-sizes      DEPRECATED: module sizes are now always shown automatically.
+echo                     Flag accepted for back-compat; does nothing.
 echo   --help, -h        Show this help message
 echo.
 echo Environment Variables:
 echo   EPF_PURGE_PASSWORD   Database password (overrides config and --password)
+echo   EPF_SYS_PASSWORD     SYS / DBA password (overrides config and --sys-password).
+echo                        Use this for unattended runs with --reclaim or --optimize-db.
 echo.
 echo Examples:
 echo   epf_purge.bat
