@@ -41,13 +41,20 @@ if ($LogFile -ne "") {
     }
 }
 
+
+# A raw StreamWriter wrapped around the OS-level standard-output handle
+# (FileStream around the Win32 STD_OUTPUT_HANDLE). This bypasses .NET's
+# Console class entirely. Without this, lines were being held back for
+# many minutes when the wrapper script hosted multiple simultaneous
+# child PowerShell processes -- only flushing when Ctrl+C terminated
+# the monitor. AutoFlush=$true makes every WriteLine push to the OS.
+$script:rawStdout = New-Object System.IO.StreamWriter(
+    [Console]::OpenStandardOutput(),
+    [Text.Encoding]::UTF8)
+$script:rawStdout.AutoFlush = $true
+
 function Write-Log($msg) {
-    # [Console]::WriteLine bypasses Write-Host's host buffer, which can
-    # otherwise hold output for many seconds when stdout is captured by a
-    # parent cmd.exe process via Start-Process -NoNewWindow. The explicit
-    # Flush() guarantees the line is on disk/screen before we move on.
-    [Console]::Out.WriteLine($msg)
-    [Console]::Out.Flush()
+    try { $script:rawStdout.WriteLine($msg) } catch { Write-Host $msg }
     if ($script:logWriter) {
         try { $script:logWriter.WriteLine($msg) } catch { }
     }
@@ -258,6 +265,7 @@ Write-Log ""
 Write-Log "[MONITOR] Monitor stopped at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 Write-Log "============================================================"
 
-# Clean up log file handles
+# Clean up handles
+if ($script:rawStdout) { try { $script:rawStdout.Flush(); $script:rawStdout.Close() } catch { } }
 if ($logWriter) { try { $logWriter.Close() } catch { } }
 if ($logStream) { try { $logStream.Close() } catch { } }

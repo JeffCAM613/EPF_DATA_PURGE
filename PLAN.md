@@ -32,6 +32,12 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) Phase 1 loop — emit `SHRINK_PROGRESS` every 10 tables OR 60s; removed buffered per-table `SHRINK OK` print
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — top-level `EXCEPTION WHEN OTHERS` emits `RECLAIM_END status=ERROR` then re-raises
 
+**Phase 1 follow-up round 2 (after second user test):**
+- [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — SHRINK_PROGRESS reverted to **every 10 tables, no wallclock floor**. The 60s floor turned into "log every iter" because individual SHRINK ops can exceed 60s, so the throttle fired every loop body. Per-N-tables cadence is the only useful knob.
+- [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — SQUEEZE_PROGRESS reverted to **every 25 iters, no wallclock floor** (user's explicit preference). Max log volume now ~80 lines for a 2000-iter cap.
+- [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — termination conditions now go through `reclaim_log` (was DBMS_OUTPUT, suppressed by `SET SERVEROUTPUT OFF`): "target reached", "max iter cap hit" (with re-run hint), "stall exit" (with re-run hint).
+- [bin/epf_monitor.ps1](bin/epf_monitor.ps1) — replaced `[Console]::Out.WriteLine + Flush()` with a raw `System.IO.StreamWriter` wrapped around `[Console]::OpenStandardOutput()` with `AutoFlush=$true`. Bypasses .NET's `Console` class buffering entirely. The earlier `Flush()` approach was insufficient — user still saw "stuck" gaps until Ctrl+C.
+
 **Phase 1 follow-up round (after first user test):**
 - [bin/epf_purge.bat](bin/epf_purge.bat) undo-restore — replaced cmd `type ... >> %LOG_FILE%` (which collides with the monitor's open write handle and prints `"The process cannot access the file because it is being used by another process."`) with the same PowerShell `FileStream(..., 'ReadWrite')` pattern used elsewhere in the .bat
 - [sql/05_reclaim_tablespace.sql](sql/05_reclaim_tablespace.sql) — `SET SERVEROUTPUT OFF` to suppress the buffered DBMS_OUTPUT flood that was dumping reclaim headers + per-iter lines after the block ended, garbling the monitor output
@@ -75,16 +81,32 @@ Update statuses inline as phases land. Test-checklist answers go directly under 
 | 1.9 | SHRINK_PROGRESS cadence (every 10 tables OR 60s). | **Pass for shrink.** The pre-fix log showed `Shrunk 758 tables (skipped 9), last: OPPAYMENTS.WORKFLOW_EVENT` lines firing throughout Phase 1 with no >60s gaps. |
 | 1.10 | No leftover inline-monitor variables in `epf_purge.sh`. | **Pass** (verified via grep). |
 
-**Re-test items after follow-up fixes (please run again):**
+**Re-test items after follow-up round 1 fixes:**
 
 | # | Check | Observation |
 |---|-------|-------------|
-| 1F.1 | Re-run end-to-end on Windows with `--reclaim`. Confirm: no `"file is being used"` warning during undo restore. | _to fill_ |
-| 1F.2 | Confirm the `Online Tablespace Reclaim` header appears AFTER `** PURGE COMPLETED **` and after `Waiting for reclaim to start...`, with no interleaving of leftover purge batch lines. | _to fill_ |
-| 1F.3 | Confirm Phase 1 → Phase 2 transition is visible: a `SQUEEZE_PROGRESS — Phase 2 squeeze starting...` line, then `Iter 1`, `Iter 11`, `Iter 21`, ... (or 60s wallclock entries when iters are slow). No >90s silence during squeeze. | _to fill_ |
-| 1F.4 | Confirm `** RECLAIM COMPLETED **` surfaces in real time at the end (no Ctrl+C needed). | _to fill_ |
-| 1F.5 | Confirm the reclaim DBMS_OUTPUT flood (header `EPF ONLINE TABLESPACE RECLAIM`, per-iter `[N] HWM=...` lines, `RECLAIM COMPLETE` summary box) is **gone** from both stdout and the logfile. | _to fill_ |
-| 1F.6 | Confirm `[OK] Online reclaim completed` appears at the very end and the wrapper exits cleanly without hang. | _to fill_ |
+| 1F.1 | Re-run end-to-end on Windows with `--reclaim`. Confirm: no `"file is being used"` warning during undo restore. | **Pass** (no warning seen this run). |
+| 1F.2 | Confirm the `Online Tablespace Reclaim` header appears AFTER `** PURGE COMPLETED **` and after `Waiting for reclaim to start...`, with no interleaving of leftover purge batch lines. | _to verify in next run_ |
+| 1F.3 | Confirm Phase 1 → Phase 2 transition is visible. | **Pass** for the boundary line itself ("Phase 2 squeeze starting" prints right after "Phase 1 SHRINK done"). |
+| 1F.4 | Confirm `** RECLAIM COMPLETED **` surfaces in real time at the end (no Ctrl+C needed). | _to verify in next run_ |
+| 1F.5 | Confirm the reclaim DBMS_OUTPUT flood is **gone** from both stdout and the logfile. | _to verify in next run_ |
+| 1F.6 | Confirm `[OK] Online reclaim completed` appears at the very end and the wrapper exits cleanly without hang. | _to verify in next run_ |
+
+**Issues found in second user test (drove round 2 fixes):**
+- 1F-2.A — Cadence too verbose: "every 10/25 iters OR 60s wallclock" became "every iter" when iters took 90-300s each (LOB MOVE on retained data). User wanted original 25-iter behavior with no floor. → **Fixed** in round 2.
+- 1F-2.B — `Console.Out.Flush()` did NOT fully resolve the buffering issue: user still saw `~8min stuck` gaps that only flushed on Ctrl+C. → **Fixed** in round 2 by switching to raw `StreamWriter` over `OpenStandardOutput()`.
+
+**Re-test items after follow-up round 2 fixes (please run again):**
+
+| # | Check | Observation |
+|---|-------|-------------|
+| 1G.1 | SQUEEZE_PROGRESS now fires every 25 iters with **no per-iter logging**, regardless of iter speed. For a 2000-iter cap, expect ~80 SQUEEZE_PROGRESS lines maximum. | _to fill_ |
+| 1G.2 | SHRINK_PROGRESS fires every 10 tables with no wallclock chatter. | _to fill_ |
+| 1G.3 | When squeeze exits because target was reached, you see a `SQUEEZE_PROGRESS — Squeeze done at iter N: HWM=...` line before reclaim moves to Phase 3 (resize). | _to fill_ |
+| 1G.4 | When squeeze exits because max iter was hit, you see `SQUEEZE_PROGRESS WARNING — Squeeze stopped: max iterations (N) reached. ...Re-run reclaim with a larger --max-iterations to continue.` | _to fill_ |
+| 1G.5 | When squeeze exits via stall, you see `SQUEEZE_PROGRESS WARNING — Squeeze stopped: 3 consecutive zero-progress checkpoints...` | _to fill_ |
+| 1G.6 | **Live output no longer "sticks"** — lines from epf_purge_log appear on screen within ~10s of being written, no Ctrl+C needed. | _to fill_ |
+| 1G.7 | `** RECLAIM COMPLETED **` (or `*** RECLAIM FAILED ***`) appears live at the end. | _to fill_ |
 
 ---
 

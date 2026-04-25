@@ -82,9 +82,11 @@ DECLARE
     v_shrink_count     NUMBER := 0;
     v_shrink_errors    NUMBER := 0;
     v_shrink_last_logged_count NUMBER := 0;       -- progress-log throttling
-    v_shrink_last_log_ts       TIMESTAMP := SYSTIMESTAMP;
     c_shrink_log_every_n  CONSTANT NUMBER := 10;  -- log SHRINK_PROGRESS every N tables
-    c_shrink_log_every_s  CONSTANT NUMBER := 60;  -- ...or N seconds, whichever first
+    -- No wallclock floor: when a single SHRINK SPACE CASCADE blocks the loop
+    -- body for many minutes, no throttle check fires anyway (the check is
+    -- between iterations). A wallclock floor only adds noise during fast
+    -- iterations; per-N-tables cadence is the only useful knob here.
     v_checkpoint_hwm   NUMBER := NULL;
     v_stall_count      NUMBER := 0;  -- consecutive stall checkpoints
     v_started          TIMESTAMP := SYSTIMESTAMP;
@@ -92,14 +94,14 @@ DECLARE
     -- run_id of the current purge run (for log entries)
     v_run_id           RAW(16) := NULL;
 
-    -- Squeeze-progress throttling. We log iter 1 + every N iters + every N
-    -- seconds wallclock, whichever comes first. Without the wallclock floor
-    -- the user can stare at a blank screen for many minutes when individual
-    -- MOVE/REBUILD operations are slow (large segments).
-    c_squeeze_log_every_n  CONSTANT NUMBER := 10;
-    c_squeeze_log_every_s  CONSTANT NUMBER := 60;
-    v_squeeze_last_logged_iter NUMBER := 0;
-    v_squeeze_last_log_ts      TIMESTAMP := SYSTIMESTAMP;
+    -- Squeeze-progress cadence: log every N iterations. NO wallclock floor.
+    -- A floor turns into "every iter" when individual MOVE/REBUILD ops are
+    -- slow (LOB segments under high retention can take 90-300s each), which
+    -- the user explicitly does not want. With pure 25-iter cadence, max
+    -- log volume = c_max_iterations / 25 lines (~80 for 2000 max).
+    -- The "Phase 2 squeeze starting" log fires before the loop, so the user
+    -- always sees a phase boundary even before the first cadence-fired log.
+    c_squeeze_log_every_n  CONSTANT NUMBER := 25;
 
     -- Cursor: find the segment whose highest extent is closest to the HWM
     -- This is the one pinning the HWM (or close to it)
@@ -288,11 +290,9 @@ BEGIN
         END;
 
         -- Live SHRINK_PROGRESS to epf_purge_log for the monitor.
-        -- Fires every N tables OR every N seconds, whichever first.
+        -- Fires every N tables (success + skip combined). No wallclock floor.
         IF (v_shrink_count + v_shrink_errors)
                 - v_shrink_last_logged_count >= c_shrink_log_every_n
-           OR (CAST(SYSTIMESTAMP AS DATE) - CAST(v_shrink_last_log_ts AS DATE)) * 86400
-                >= c_shrink_log_every_s
         THEN
             reclaim_log('SHRINK_PROGRESS', 'INFO',
                 'Shrunk ' || v_shrink_count || ' tables'
@@ -300,7 +300,6 @@ BEGIN
                 || ' last: ' || tbl.owner || '.' || tbl.table_name,
                 ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
             v_shrink_last_logged_count := v_shrink_count + v_shrink_errors;
-            v_shrink_last_log_ts       := SYSTIMESTAMP;
         END IF;
     END LOOP;
 
@@ -359,25 +358,39 @@ BEGIN
     DBMS_OUTPUT.PUT_LINE('=== Phase 2: SQUEEZE (lowering HWM from '
         || ROUND(v_hwm_gb, 4) || ' to ' || ROUND(v_target_hwm_gb, 4) || ' GB) ===');
 
-    -- Live SQUEEZE_START so the monitor draws a line between Phase 1 and
-    -- Phase 2 immediately, not after the first 10 iters or 60s of silence.
+    -- Live SQUEEZE_START so the monitor draws a clear phase boundary
+    -- before the (potentially long) wait for the first cadence-fired log.
     reclaim_log('SQUEEZE_PROGRESS', 'INFO',
         'Phase 2 squeeze starting. HWM=' || ROUND(v_hwm_gb, 4) || 'GB'
         || ', Target=' || ROUND(v_target_hwm_gb, 4) || 'GB'
         || ', MaxIter=' || c_max_iterations,
         ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
-    v_squeeze_last_log_ts := SYSTIMESTAMP;
 
     LOOP
         v_iteration := v_iteration + 1;
-        EXIT WHEN v_iteration > c_max_iterations;
+        IF v_iteration > c_max_iterations THEN
+            -- Surface the cap-hit reason live so the user knows reclaim
+            -- exited because of the iteration limit (not because the target
+            -- was reached). This drives the "consider re-running with a
+            -- larger --max-iterations" recommendation in the wrapper.
+            reclaim_log('SQUEEZE_PROGRESS', 'WARNING',
+                'Squeeze stopped: max iterations (' || c_max_iterations
+                || ') reached. HWM=' || ROUND(v_hwm_gb, 4) || 'GB still'
+                || ' above target ' || ROUND(v_target_hwm_gb, 4) || 'GB.'
+                || ' Re-run reclaim with a larger --max-iterations to continue.',
+                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+            EXIT;
+        END IF;
 
         v_hwm_gb := get_hwm_gb;
 
         -- Check if we've reached the target
         IF v_hwm_gb <= v_target_hwm_gb THEN
-            DBMS_OUTPUT.PUT_LINE('[' || v_iteration || '] HWM ' || ROUND(v_hwm_gb, 4)
-                || ' GB <= target ' || ROUND(v_target_hwm_gb, 4) || ' GB. Done!');
+            reclaim_log('SQUEEZE_PROGRESS', 'INFO',
+                'Squeeze done at iter ' || v_iteration || ': HWM='
+                || ROUND(v_hwm_gb, 4) || 'GB <= target '
+                || ROUND(v_target_hwm_gb, 4) || 'GB.',
+                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
             EXIT;
         END IF;
 
@@ -570,16 +583,9 @@ BEGIN
             v_checkpoint_hwm := v_new_hwm_gb;
         END IF;
 
-        -- Log SQUEEZE_PROGRESS to epf_purge_log for the live monitor.
-        -- Triggers on iter 1 (first iteration always logged, so the user
-        -- sees motion immediately), then every N iters OR every N seconds
-        -- wallclock, whichever comes first. Without the wallclock floor,
-        -- a slow MOVE on a large segment can cause many minutes of silence.
-        IF v_iteration = 1
-           OR (v_iteration - v_squeeze_last_logged_iter) >= c_squeeze_log_every_n
-           OR (CAST(SYSTIMESTAMP AS DATE) - CAST(v_squeeze_last_log_ts AS DATE)) * 86400
-                >= c_squeeze_log_every_s
-        THEN
+        -- SQUEEZE_PROGRESS cadence: every N iters. No wallclock floor.
+        -- For 2000 max iters at N=25 that yields at most ~80 lines.
+        IF MOD(v_iteration, c_squeeze_log_every_n) = 0 THEN
             reclaim_log('SQUEEZE_PROGRESS', 'INFO',
                 'Iter ' || v_iteration || '/' || c_max_iterations
                 || ', HWM=' || ROUND(v_new_hwm_gb, 4) || 'GB'
@@ -587,8 +593,6 @@ BEGIN
                 || ', Segment=' || v_seg_owner || '.' || v_seg_name
                 || ' (' || v_seg_type || ')',
                 ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
-            v_squeeze_last_logged_iter := v_iteration;
-            v_squeeze_last_log_ts      := SYSTIMESTAMP;
         END IF;
 
         IF MOD(v_iteration, c_stall_check_every) = 0 THEN
@@ -599,25 +603,25 @@ BEGIN
 
             IF v_checkpoint_hwm - v_new_hwm_gb <= c_stall_min_drop_gb THEN
                 v_stall_count := v_stall_count + 1;
-                DBMS_OUTPUT.PUT_LINE('');
-                DBMS_OUTPUT.PUT_LINE('STALL WARNING at iteration ' || v_iteration
-                    || ' (consecutive: ' || v_stall_count || '/' || c_max_stalls
-                    || '): HWM dropped only '
-                    || ROUND(v_checkpoint_hwm - v_new_hwm_gb, 4)
-                    || ' GB in last ' || c_stall_check_every || ' iterations.');
-                DBMS_OUTPUT.PUT_LINE('Remaining gap: HWM '
-                    || ROUND(v_new_hwm_gb, 4) || ' GB vs target '
-                    || ROUND(v_target_hwm_gb, 4) || ' GB.');
                 IF NOT c_skip_stall_checks AND v_stall_count >= c_max_stalls THEN
-                    DBMS_OUTPUT.PUT_LINE('Giving up after ' || c_max_stalls
-                        || ' consecutive zero-progress checkpoints.');
+                    reclaim_log('SQUEEZE_PROGRESS', 'WARNING',
+                        'Squeeze stopped: ' || c_max_stalls || ' consecutive '
+                        || 'zero-progress checkpoints at iter ' || v_iteration
+                        || '. HWM=' || ROUND(v_new_hwm_gb, 4) || 'GB still'
+                        || ' above target ' || ROUND(v_target_hwm_gb, 4) || 'GB.'
+                        || ' Pass --no-stall-check to keep going,'
+                        || ' or re-run with --max-iterations to extend.',
+                        ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
                     EXIT;
-                END IF;
-                IF c_skip_stall_checks THEN
-                    DBMS_OUTPUT.PUT_LINE('Stall checks DISABLED -- continuing ('
-                        || (c_max_iterations - v_iteration) || ' iterations remaining)...');
                 ELSE
-                    DBMS_OUTPUT.PUT_LINE('Continuing with tighter ceiling...');
+                    reclaim_log('SQUEEZE_PROGRESS', 'WARNING',
+                        'Stall ' || v_stall_count || '/' || c_max_stalls
+                        || ' at iter ' || v_iteration || ': HWM dropped only '
+                        || ROUND(v_checkpoint_hwm - v_new_hwm_gb, 4) || 'GB in '
+                        || 'last ' || c_stall_check_every || ' iters. '
+                        || CASE WHEN c_skip_stall_checks THEN 'Stall checks disabled, continuing.'
+                                ELSE 'Continuing with tighter ceiling.' END,
+                        ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
                 END IF;
             ELSE
                 v_stall_count := 0;  -- reset on progress
