@@ -56,84 +56,12 @@ function Write-Log($msg) {
     }
 }
 
-# Hard-timeout sqlplus runner. Returns the array of non-empty stdout lines, or
-# $null on timeout / process failure. Replaces the prior "$sql | sqlplus -S
-# $Conn" pattern that had no timeout: a single stalled sqlplus call (network
-# blip, blocked session, hung session-info query) would freeze the polling
-# loop indefinitely until the operator killed the window. With this wrapper,
-# the worst case per poll is a $TimeoutSec wait followed by a clean retry.
-#
-# Notes:
-#   -L: do not re-prompt for credentials on logon failure; exit immediately.
-#       Without -L, a stale password or TNS hiccup makes sqlplus hang on the
-#       "Username:" prompt forever (it reads stdin, which we never close).
-#   Async stdout read (ReadToEndAsync) prevents pipe-fill deadlock if the
-#   query somehow returns more data than the OS pipe buffer.
-#   Temp-file SQL avoids the $sql|sqlplus stdin pipe, which on PowerShell 5.1
-#   has been observed to occasionally stall on Windows.
-function Invoke-Sqlplus {
-    param(
-        [Parameter(Mandatory=$true)] [string]$Sql,
-        [Parameter(Mandatory=$true)] [string]$Conn,
-        [int]$TimeoutSec = 60
-    )
-    $tag    = [Guid]::NewGuid().ToString("N").Substring(0, 8)
-    $tmpSql = Join-Path $env:TEMP ("epf_mon_" + $tag + ".sql")
-    $proc   = $null
-    try {
-        [IO.File]::WriteAllText($tmpSql, $Sql, [Text.Encoding]::ASCII)
-
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName               = "sqlplus"
-        $psi.Arguments              = "-L -S `"$Conn`" `"@$tmpSql`""
-        $psi.UseShellExecute        = $false
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError  = $true
-        $psi.CreateNoWindow         = $true
-
-        $proc = [System.Diagnostics.Process]::Start($psi)
-        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-        $null       = $proc.StandardError.ReadToEndAsync()  # drain to avoid stderr-pipe deadlock
-
-        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-            try { $proc.Kill() } catch { }
-            try { $proc.WaitForExit(2000) | Out-Null } catch { }
-            return $null
-        }
-
-        $stdout = $stdoutTask.Result
-        if (-not $stdout) { return @() }
-        return ($stdout -split "`r?`n") | Where-Object { $_.Trim() -ne "" }
-    }
-    catch {
-        return $null
-    }
-    finally {
-        if ($proc) { try { $proc.Dispose() } catch { } }
-        if (Test-Path -LiteralPath $tmpSql) {
-            Remove-Item -LiteralPath $tmpSql -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-# Track consecutive timeouts so a stuck sqlplus surfaces as a visible warning
-# rather than a silent gap in the log.
-$script:consecutiveTimeouts = 0
-function Note-PollResult($result, $context) {
-    if ($null -eq $result) {
-        $script:consecutiveTimeouts++
-        # Warn on first timeout, then every 5th, to avoid spamming the log.
-        if ($script:consecutiveTimeouts -eq 1 -or
-            ($script:consecutiveTimeouts % 5) -eq 0) {
-            Write-Log ("[MONITOR] WARN: sqlplus poll timed out (" + $context +
-                ", consecutive=" + $script:consecutiveTimeouts +
-                "). Will retry on next interval.")
-        }
-    }
-    else {
-        $script:consecutiveTimeouts = 0
-    }
-}
+# Sqlplus connection string with the -L flag baked in. -L makes sqlplus exit
+# on logon failure rather than re-prompting for credentials on stdin (which
+# would deadlock our pipe). All polls use this via `$sql | sqlplus -L -S ...`.
+# The pipe pattern is intentional: an earlier attempt to wrap each call in a
+# Process.Start + WaitForExit timeout reliably triggered false-positive
+# timeouts that stopped the monitor from displaying new rows entirely.
 
 Write-Log "============================================================"
 Write-Log "  EPF PURGE - LIVE MONITOR"
@@ -180,8 +108,7 @@ SELECT RAWTOHEX(run_id) FROM (
 ) WHERE ROWNUM = 1;
 EXIT;
 "@
-        $result = Invoke-Sqlplus -Sql $sql -Conn $ConnStr -TimeoutSec 60
-        Note-PollResult $result "discover-run-id"
+        $result = ($sql | sqlplus -L -S "$ConnStr" 2>$null) | Where-Object { $_.Trim() -ne "" }
         if ($result) {
             $runId = ($result | Select-Object -First 1).Trim()
             if ($runId -and $runId.Length -ge 16) {
@@ -219,9 +146,7 @@ WHERE run_id = HEXTORAW('$runId')
 ORDER BY log_id;
 EXIT;
 "@
-        $rows = Invoke-Sqlplus -Sql $sql -Conn $ConnStr -TimeoutSec 60
-        Note-PollResult $rows "fetch-new-log-entries"
-        if ($null -eq $rows) { $rows = @() }
+        $rows = ($sql | sqlplus -L -S "$ConnStr" 2>$null) | Where-Object { $_.Trim() -ne "" }
 
         $anyNew = $false
         foreach ($row in $rows) {
@@ -317,10 +242,8 @@ SELECT RAWTOHEX(run_id) FROM (
 ) WHERE ROWNUM = 1;
 EXIT;
 "@
-            $recheck = Invoke-Sqlplus -Sql $sqlRecheck -Conn $ConnStr -TimeoutSec 60
-            Note-PollResult $recheck "recheck-latest-run-id"
-            $latestId = $null
-            if ($recheck) { $latestId = ($recheck | Select-Object -First 1).Trim() }
+            $latestId = (($sqlRecheck | sqlplus -L -S "$ConnStr" 2>$null) | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
+            if ($latestId) { $latestId = $latestId.Trim() }
             if ($latestId -and $latestId.Length -ge 16 -and $latestId -ne $runId) {
                 Write-Log ""
                 Write-Log "[MONITOR] Newer run detected: $latestId (was $runId)"
@@ -339,13 +262,9 @@ WHERE run_id = HEXTORAW('$runId')
   AND (operation = 'RECLAIM_END' OR (module = 'ORCHESTRATOR' AND status = 'ERROR'));
 EXIT;
 "@
-                $endRows = Invoke-Sqlplus -Sql $sqlCheck -Conn $ConnStr -TimeoutSec 60
-                Note-PollResult $endRows "check-end-marker"
-                if ($endRows) {
-                    $endCount = ($endRows | Select-Object -First 1).Trim()
-                    if ($endCount -and [int]$endCount -gt 0) {
-                        $done = $true
-                    }
+                $endCount = (($sqlCheck | sqlplus -L -S "$ConnStr" 2>$null) | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1).Trim()
+                if ($endCount -and [int]$endCount -gt 0) {
+                    $done = $true
                 }
             }
         }
