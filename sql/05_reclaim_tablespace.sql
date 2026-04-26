@@ -104,6 +104,24 @@ DECLARE
     v_stall_count      NUMBER := 0;  -- consecutive stall checkpoints
     v_started          TIMESTAMP := SYSTIMESTAMP;
 
+    -- Per-segment skip tracking. Some indexes/segments refuse to relocate
+    -- via ONLINE rebuild -- e.g. an index on a table with concurrent writes
+    -- that keeps re-allocating extents above the squeeze ceiling, or a
+    -- segment with storage properties that prevent MOVE/REBUILD from
+    -- changing its block_id range. Without this guard, the loop fixates
+    -- on the stuck segment and burns iterations until max_iterations is
+    -- reached while HWM never falls. Tracking consecutive no-progress
+    -- iterations per (owner, segment_name) and quarantining after
+    -- c_max_same_seg_retries lets the loop fall through to the
+    -- next-highest segment instead of looping pointlessly.
+    TYPE t_skip_set IS TABLE OF VARCHAR2(1) INDEX BY VARCHAR2(257);
+    v_skip_segments        t_skip_set;
+    v_seg_key              VARCHAR2(257);
+    v_last_seg_key         VARCHAR2(257) := NULL;
+    v_same_seg_count       NUMBER := 0;
+    c_max_same_seg_retries CONSTANT NUMBER := 3;
+    v_top_found            BOOLEAN;
+
     -- run_id of the current purge run (for log entries)
     v_run_id           RAW(16) := NULL;
 
@@ -116,17 +134,9 @@ DECLARE
     -- always sees a phase boundary even before the first cadence-fired log.
     c_squeeze_log_every_n  CONSTANT NUMBER := 25;
 
-    -- Cursor: find the segment whose highest extent is closest to the HWM
-    -- This is the one pinning the HWM (or close to it)
-    CURSOR c_top_segment(p_ts VARCHAR2) IS
-        SELECT owner, segment_name, segment_type,
-               ROUND(MAX(block_id + blocks) * v_block_size / 1024/1024/1024, 6) AS extent_end_gb,
-               ROUND(SUM(bytes)/1024/1024, 1) AS segment_mb
-        FROM dba_extents
-        WHERE tablespace_name = p_ts
-        GROUP BY owner, segment_name, segment_type
-        ORDER BY extent_end_gb DESC
-        FETCH FIRST 1 ROW ONLY;
+    -- (top-segment selection is now an inline FOR loop over the top 50
+    --  highest segments, so the squeeze can skip a stuck segment and
+    --  pick the next-highest -- see the squeeze loop below.)
 
     -- Cursor: find LOB columns for a table (to move LOB segments too)
     CURSOR c_lob_cols(p_owner VARCHAR2, p_table VARCHAR2) IS
@@ -408,20 +418,20 @@ BEGIN
         || ', MaxIter=' || c_max_iterations,
         ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
 
+    <<squeeze_loop>>
     LOOP
         v_iteration := v_iteration + 1;
         IF v_iteration > c_max_iterations THEN
             -- Surface the cap-hit reason live so the user knows reclaim
             -- exited because of the iteration limit (not because the target
-            -- was reached). This drives the "consider re-running with a
-            -- larger --max-iterations" recommendation in the wrapper.
+            -- was reached). The wrapper banner adds an actionable re-run
+            -- command -- keep this message concise.
             reclaim_log('SQUEEZE_PROGRESS', 'WARNING',
                 'Squeeze stopped: max iterations (' || c_max_iterations
                 || ') reached. HWM=' || ROUND(v_hwm_gb, 4) || 'GB still'
-                || ' above target ' || ROUND(v_target_hwm_gb, 4) || 'GB.'
-                || ' Re-run reclaim with a larger --max-iterations to continue.',
+                || ' above target ' || ROUND(v_target_hwm_gb, 4) || 'GB.',
                 ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
-            EXIT;
+            EXIT squeeze_loop;
         END IF;
 
         v_hwm_gb := get_hwm_gb;
@@ -433,13 +443,48 @@ BEGIN
                 || ROUND(v_hwm_gb, 4) || 'GB <= target '
                 || ROUND(v_target_hwm_gb, 4) || 'GB.',
                 ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
-            EXIT;
+            EXIT squeeze_loop;
         END IF;
 
-        -- Find the top segment (pinning HWM)
-        OPEN c_top_segment(v_tablespace);
-        FETCH c_top_segment INTO v_seg_owner, v_seg_name, v_seg_type, v_seg_end_gb, v_seg_mb;
-        CLOSE c_top_segment;
+        -- Pick the highest segment NOT in the skip list. We pull the top 50
+        -- and walk down -- so if NDX_TAUX_TMP (or any other segment that
+        -- refuses to relocate via ONLINE rebuild) has been quarantined by
+        -- the per-segment retry counter below, we transparently fall
+        -- through to the next-highest segment instead of fixating.
+        v_top_found := FALSE;
+        FOR rec IN (
+            SELECT owner, segment_name, segment_type,
+                   ROUND(MAX(block_id + blocks) * v_block_size / 1024/1024/1024, 6) AS extent_end_gb,
+                   ROUND(SUM(bytes)/1024/1024, 1) AS segment_mb
+            FROM dba_extents
+            WHERE tablespace_name = v_tablespace
+            GROUP BY owner, segment_name, segment_type
+            ORDER BY MAX(block_id + blocks) DESC
+            FETCH FIRST 50 ROWS ONLY
+        ) LOOP
+            IF NOT v_skip_segments.EXISTS(rec.owner || '.' || rec.segment_name) THEN
+                v_seg_owner  := rec.owner;
+                v_seg_name   := rec.segment_name;
+                v_seg_type   := rec.segment_type;
+                v_seg_end_gb := rec.extent_end_gb;
+                v_seg_mb     := rec.segment_mb;
+                v_top_found  := TRUE;
+                EXIT;  -- inner FOR only; outer is squeeze_loop
+            END IF;
+        END LOOP;
+
+        IF NOT v_top_found THEN
+            reclaim_log('SQUEEZE_PROGRESS', 'WARNING',
+                'Squeeze stopped: every segment in the top 50 has been'
+                || ' quarantined (' || v_skip_segments.COUNT || ' skipped)'
+                || ' after repeatedly failing to relocate. HWM still '
+                || ROUND(v_hwm_gb, 4) || 'GB above target '
+                || ROUND(v_target_hwm_gb, 4) || 'GB. Inspect the skipped'
+                || ' segments manually -- DROP+CREATE indexes or move'
+                || ' tables during a maintenance window.',
+                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+            EXIT squeeze_loop;
+        END IF;
 
         DBMS_OUTPUT.PUT_LINE('[' || v_iteration || '] HWM=' || ROUND(v_hwm_gb, 4)
             || 'GB  Top: ' || v_seg_owner || '.' || v_seg_name
@@ -612,12 +657,42 @@ BEGIN
         <<next_iteration>>
         -- Check if HWM actually dropped
         v_new_hwm_gb := get_hwm_gb;
+        v_seg_key := v_seg_owner || '.' || v_seg_name;
         IF v_new_hwm_gb >= v_hwm_gb THEN
             DBMS_OUTPUT.PUT_LINE('       HWM unchanged (' || ROUND(v_new_hwm_gb, 4)
                 || ' GB). Will retry with tighter ceiling.');
+            -- Track consecutive no-progress iterations on the same segment.
+            -- If the same segment is the top and HWM doesn't budge for
+            -- c_max_same_seg_retries iterations in a row, quarantine it
+            -- so subsequent iterations pick the next-highest segment.
+            IF v_seg_key = v_last_seg_key THEN
+                v_same_seg_count := v_same_seg_count + 1;
+            ELSE
+                v_same_seg_count := 1;
+                v_last_seg_key   := v_seg_key;
+            END IF;
+            IF v_same_seg_count >= c_max_same_seg_retries THEN
+                v_skip_segments(v_seg_key) := 'Y';
+                reclaim_log('SQUEEZE_PROGRESS', 'WARNING',
+                    'Quarantining ' || v_seg_key || ' (' || v_seg_type
+                    || ') after ' || c_max_same_seg_retries
+                    || ' consecutive no-progress iterations. ONLINE rebuild'
+                    || ' is not relocating it (likely concurrent workload'
+                    || ' or a non-relocatable segment property). Skipping'
+                    || ' for the rest of this run; falling through to the'
+                    || ' next-highest segment.',
+                    ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+                v_same_seg_count := 0;
+                v_last_seg_key   := NULL;
+            END IF;
         ELSE
             DBMS_OUTPUT.PUT_LINE('       HWM dropped: ' || ROUND(v_hwm_gb, 4)
                 || ' -> ' || ROUND(v_new_hwm_gb, 4) || ' GB');
+            -- Any HWM progress resets the per-segment retry counter so
+            -- a segment that drops once and re-tops later still gets
+            -- a fresh c_max_same_seg_retries chances.
+            v_same_seg_count := 0;
+            v_last_seg_key   := NULL;
         END IF;
 
         -- Stall detection: every N iterations, check if meaningful progress was made
@@ -654,7 +729,7 @@ BEGIN
                         || ' Pass --no-stall-check to keep going,'
                         || ' or re-run with --max-iterations to extend.',
                         ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
-                    EXIT;
+                    EXIT squeeze_loop;
                 ELSE
                     reclaim_log('SQUEEZE_PROGRESS', 'WARNING',
                         'Stall ' || v_stall_count || '/' || c_max_stalls
@@ -670,7 +745,7 @@ BEGIN
             END IF;
             v_checkpoint_hwm := v_new_hwm_gb;
         END IF;
-    END LOOP;
+    END LOOP squeeze_loop;
 
     -- ========================================================================
     -- Step 3: Final datafile resize

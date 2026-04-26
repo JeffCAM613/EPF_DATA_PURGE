@@ -814,18 +814,14 @@ if /i not "%DRY_RUN%"=="Y" (
             set "CURRENT_MAX=!MAX_ITERATIONS!"
             if "!CURRENT_MAX!"=="" set "CURRENT_MAX=!EPF_RECOMMENDED_MAX_ITER!"
             if "!CURRENT_MAX!"=="" set "CURRENT_MAX=2000"
-            set /a "SUGGESTED=CURRENT_MAX * 2"
-            if !SUGGESTED! GTR 20000 set "SUGGESTED=20000"
             echo.
             call :log "[WARN]  ============================================================"
             call :log "[WARN]    RECLAIM DID NOT REACH TARGET HWM"
             call :log "[WARN]    !SQUEEZE_HIT!"
             call :log "[WARN]    --"
-            call :log "[WARN]    To squeeze further, re-run reclaim with a larger cap:"
-            call :log "[WARN]      bin\epf_purge.bat --tns %TNS_NAME% --user %USERNAME% ^^"
-            call :log "[WARN]        --reclaim-only --sys-password ^<sys-pw^> ^^"
-            call :log "[WARN]        --max-iterations !SUGGESTED!"
-            call :log "[WARN]    ^(Current run used max_iterations=!CURRENT_MAX!.^)"
+            call :log "[WARN]    Re-run reclaim ^(you'll be prompted for the SYS password^):"
+            call :log "[WARN]      bin\epf_purge.bat --tns %TNS_NAME% --reclaim-only ^^"
+            call :log "[WARN]        --max-iterations !CURRENT_MAX! --no-stall-check"
             call :log "[WARN]  ============================================================"
         )
     )
@@ -885,9 +881,13 @@ exit /b 0
 REM ============================================================================
 REM Log helper: writes message to both console and log file
 REM ============================================================================
+REM Leading redirects (NOT a parenthesised group) so messages containing
+REM literal "(...)" -- e.g. "max iterations (2050) reached." piped in from
+REM 05_reclaim_tablespace.sql -- don't trip cmd's block-paren counter and
+REM produce "reached. was unexpected at this time." parser errors.
 :log
 echo(%~1
-(>>"%LOG_FILE%" echo(%~1) 2>nul
+>>"%LOG_FILE%" 2>nul echo(%~1
 exit /b 0
 
 REM ============================================================================

@@ -901,18 +901,14 @@ SQLEOF
         hit=$(echo "$hit" | xargs)
         if [[ -n "$hit" ]]; then
             local current_max="${MAX_ITERATIONS:-${EPF_RECOMMENDED_MAX_ITER:-2000}}"
-            local suggested=$(( current_max * 2 ))
-            (( suggested > 20000 )) && suggested=20000
             echo "" | tee -a "$LOG_FILE"
             log_warn "============================================================"
             log_warn "  RECLAIM DID NOT REACH TARGET HWM"
             log_warn "  ${hit}"
             log_warn "  --"
-            log_warn "  To squeeze further, re-run reclaim with a larger cap:"
-            log_warn "    bin/epf_purge.sh --tns ${TNS_NAME} --user ${USERNAME} \\"
-            log_warn "      --reclaim-only --sys-password '<sys-pw>' \\"
-            log_warn "      --max-iterations ${suggested}"
-            log_warn "  (Current run used max_iterations=${current_max}.)"
+            log_warn "  Re-run reclaim (you'll be prompted for the SYS password):"
+            log_warn "    bin/epf_purge.sh --tns ${TNS_NAME} --reclaim-only \\"
+            log_warn "      --max-iterations ${current_max} --no-stall-check"
             log_warn "============================================================"
         fi
     fi
