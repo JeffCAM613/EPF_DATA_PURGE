@@ -39,6 +39,7 @@ set "DRY_RUN=N"
 set "RECLAIM_SPACE=N"
 set "RECLAIM_ONLY=N"
 set "SKIP_STALL_CHECKS=N"
+set "ALLOW_OFFLINE_IDX=N"
 set "OPTIMIZE_DB=N"
 set "SYS_PASSWORD="
 set "ASSUME_YES=N"
@@ -81,6 +82,7 @@ if /i "%~1"=="--reclaim-only" ( set "RECLAIM_ONLY=Y" & set "RECLAIM_SPACE=Y" & s
 if /i "%~1"=="--reclaim-online"      ( set "RECLAIM_SPACE=Y" & shift & goto :parse_args )
 if /i "%~1"=="--reclaim-online-only" ( set "RECLAIM_ONLY=Y" & set "RECLAIM_SPACE=Y" & shift & goto :parse_args )
 if /i "%~1"=="--no-stall-check" ( set "SKIP_STALL_CHECKS=Y" & shift & goto :parse_args )
+if /i "%~1"=="--allow-offline-index-rebuild" ( set "ALLOW_OFFLINE_IDX=Y" & shift & goto :parse_args )
 if /i "%~1"=="--optimize-db" ( set "OPTIMIZE_DB=Y" & shift & goto :parse_args )
 if /i "%~1"=="--sys-password"  ( set "SYS_PASSWORD=%~2" & shift & shift & goto :parse_args )
 if /i "%~1"=="--assume-yes"    ( set "ASSUME_YES=Y" & shift & goto :parse_args )
@@ -132,8 +134,8 @@ if /i "%RECLAIM_ONLY%"=="Y" (
     )
     echo [INFO]  Skipping purge. Running online reclaim only.
     if "!MAX_ITERATIONS!"=="" set "MAX_ITERATIONS=2000"
-    REM Positional args: target_pct_free, max_iterations, skip_stall_checks
-    > "%TEMP%\epf_reclaim_online.sql" echo @"%SQL_DIR%\05_reclaim_tablespace.sql" 10 !MAX_ITERATIONS! !SKIP_STALL_CHECKS!
+    REM Positional args: target_pct_free, max_iterations, skip_stall_checks, allow_offline_idx
+    > "%TEMP%\epf_reclaim_online.sql" echo @"%SQL_DIR%\05_reclaim_tablespace.sql" 10 !MAX_ITERATIONS! !SKIP_STALL_CHECKS! !ALLOW_OFFLINE_IDX!
     >> "%TEMP%\epf_reclaim_online.sql" echo EXIT;
     powershell -Command "& { $fs=[IO.FileStream]::new('%LOG_FILE%','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S 'sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA' '@%TEMP%\epf_reclaim_online.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
     del "%TEMP%\epf_reclaim_online.sql" >nul 2>&1
@@ -716,9 +718,9 @@ if /i "%RECLAIM_SPACE%"=="Y" (
         echo   ============================================================
         if "!MAX_ITERATIONS!"=="" set "MAX_ITERATIONS=!EPF_RECOMMENDED_MAX_ITER!"
         if "!MAX_ITERATIONS!"=="" set "MAX_ITERATIONS=2000"
-        call :log "[INFO]  Reclaim parameters: target_pct_free=10, max_iterations=!MAX_ITERATIONS!, skip_stall_checks=!SKIP_STALL_CHECKS!"
-        REM Positional args: target_pct_free, max_iterations, skip_stall_checks
-        > "%TEMP%\epf_reclaim_online.sql" echo @"%SQL_DIR%\05_reclaim_tablespace.sql" 10 !MAX_ITERATIONS! !SKIP_STALL_CHECKS!
+        call :log "[INFO]  Reclaim parameters: target_pct_free=10, max_iterations=!MAX_ITERATIONS!, skip_stall_checks=!SKIP_STALL_CHECKS!, allow_offline_idx=!ALLOW_OFFLINE_IDX!"
+        REM Positional args: target_pct_free, max_iterations, skip_stall_checks, allow_offline_idx
+        > "%TEMP%\epf_reclaim_online.sql" echo @"%SQL_DIR%\05_reclaim_tablespace.sql" 10 !MAX_ITERATIONS! !SKIP_STALL_CHECKS! !ALLOW_OFFLINE_IDX!
         >> "%TEMP%\epf_reclaim_online.sql" echo EXIT;
         powershell -Command "& { $fs=[IO.FileStream]::new('!LOG_FILE!','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S 'sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA' '@%TEMP%\epf_reclaim_online.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
         del "%TEMP%\epf_reclaim_online.sql" >nul 2>&1
@@ -821,7 +823,13 @@ if /i not "%DRY_RUN%"=="Y" (
             call :log "[WARN]    --"
             call :log "[WARN]    Re-run reclaim ^(you'll be prompted for the SYS password^):"
             call :log "[WARN]      bin\epf_purge.bat --tns %TNS_NAME% --reclaim-only ^^"
-            call :log "[WARN]        --max-iterations !CURRENT_MAX! --no-stall-check"
+            call :log "[WARN]        --max-iterations !CURRENT_MAX! --no-stall-check ^^"
+            call :log "[WARN]        --allow-offline-index-rebuild"
+            call :log "[WARN]    --"
+            call :log "[WARN]    The --allow-offline-index-rebuild flag enables a DROP+CREATE"
+            call :log "[WARN]    fallback for indexes stuck near the HWM due to Oracle's"
+            call :log "[WARN]    REBUILD ONLINE locality bias. The index is briefly unavailable"
+            call :log "[WARN]    during recreation; only safe for clones / outage windows."
             call :log "[WARN]  ============================================================"
         )
     )
@@ -844,13 +852,16 @@ if not "!MONITOR_PID!"=="" (
 REM ============================================================================
 REM Drop package if requested
 REM ============================================================================
+REM The monitor process may still be holding LOG_FILE open here, so use the
+REM FileStream pattern (FileShare.ReadWrite) instead of cmd `>>` for any
+REM remaining sqlplus output appends -- mirrors lines 640/663/689/723 above.
 if /i "%DROP_PACKAGE_AFTER%"=="Y" (
     echo.
     echo [INFO]  Dropping PL/SQL package...
-    (
-        echo @"%SQL_DIR%\04_drop_epf_purge_pkg.sql"
-        echo EXIT;
-    ) | sqlplus -S "!USERNAME!/!PASSWORD!@!TNS_NAME!" >> "%LOG_FILE%" 2>&1
+    > "%TEMP%\epf_droppkg.sql" echo @"%SQL_DIR%\04_drop_epf_purge_pkg.sql"
+    >> "%TEMP%\epf_droppkg.sql" echo EXIT;
+    powershell -Command "& { $fs=[IO.FileStream]::new('!LOG_FILE!','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S '!USERNAME!/!PASSWORD!@!TNS_NAME!' '@%TEMP%\epf_droppkg.sql' 2>&1 | ForEach-Object { $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
+    del "%TEMP%\epf_droppkg.sql" >nul 2>&1
     call :log "[OK]    Package dropped"
 )
 
@@ -863,7 +874,7 @@ if /i "%DROP_LOGS%"=="Y" (
     echo DROP TABLE oppayments.epf_purge_space_snapshot PURGE;> "%TEMP%\epf_droplogs.sql"
     echo DROP TABLE oppayments.epf_purge_log PURGE;>> "%TEMP%\epf_droplogs.sql"
     echo EXIT;>> "%TEMP%\epf_droplogs.sql"
-    sqlplus -S "!USERNAME!/!PASSWORD!@!TNS_NAME!" @"%TEMP%\epf_droplogs.sql" >> "%LOG_FILE%" 2>&1
+    powershell -Command "& { $fs=[IO.FileStream]::new('!LOG_FILE!','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S '!USERNAME!/!PASSWORD!@!TNS_NAME!' '@%TEMP%\epf_droplogs.sql' 2>&1 | ForEach-Object { $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
     del "%TEMP%\epf_droplogs.sql" >nul 2>&1
     call :log "[OK]    Purge log tables dropped"
 )
@@ -873,7 +884,7 @@ REM Done
 REM ============================================================================
 call :log "."
 call :log "[OK]    EPF Data Purge completed. Log: %LOG_FILE%"
-echo Finished: %DATE% %TIME% >> "%LOG_FILE%"
+call :log "Finished: %DATE% %TIME%"
 
 endlocal
 exit /b 0
@@ -881,20 +892,23 @@ exit /b 0
 REM ============================================================================
 REM Log helper: writes message to both console and log file
 REM ============================================================================
-REM Leading redirects (NOT a parenthesised group) so messages containing
-REM literal "(...)" -- e.g. "max iterations (2050) reached." piped in from
-REM 05_reclaim_tablespace.sql -- don't trip cmd's block-paren counter and
-REM produce "reached. was unexpected at this time." parser errors.
+REM File append uses PowerShell FileStream with FileShare.ReadWrite so it
+REM coexists with the live monitor process (which holds the same file open
+REM with the same share mode). Plain cmd `>>` opens with FILE_SHARE_READ
+REM only, which is incompatible with the monitor's writer share -- when both
+REM hit the file at the same instant, cmd raises a parser-level "process
+REM cannot access the file" error that `2>nul` does not reliably suppress.
 REM
-REM 2>nul MUST come before >>"%LOG_FILE%" so stderr is already redirected to
-REM NUL when the >> open is attempted.  If the monitor process holds the log
-REM file open (FileStream ReadWrite), cmd's >> (FILE_SHARE_READ) gets a
-REM sharing violation and writes the error to handle 2.  With the old order
-REM (>>file 2>nul), handle 2 was still the console when the open failed,
-REM causing a visible "The process cannot access the file..." error.
+REM Cost: each :log call spawns one powershell.exe (~100 ms). The wrapper
+REM makes ~30 such calls in a normal run (~3 s total overhead). High-volume
+REM sqlplus output streams already use the FileStream pattern inline, so
+REM they do not pay this per-line cost.
+REM
+REM Retry loop covers transient sharing violations from indexers/AV.
 :log
 echo(%~1
-2>nul >>"%LOG_FILE%" echo(%~1
+set "EPF_LOG_LINE=%~1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$msg=$env:EPF_LOG_LINE; $r=0; while($r -lt 5){ try { $fs=[IO.FileStream]::new($env:LOG_FILE,'Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; $w.WriteLine($msg); $w.Close(); $fs.Close(); break } catch { $r++; Start-Sleep -Milliseconds 100 } }" 2>nul
 exit /b 0
 
 REM ============================================================================
@@ -983,6 +997,11 @@ echo   --max-iterations N Reclaim squeeze cap. Default = max(2000, 50*datafile_g
 echo                     capped at 20000. Wrapper recommends a value based on the
 echo                     OPPAYMENTS tablespace datafile size queried at startup.
 echo   --no-stall-check  Disable stall detection during reclaim (always run all iterations)
+echo   --allow-offline-index-rebuild  Permit DROP+CREATE INDEX fallback when an
+echo                     index refuses to relocate via REBUILD ONLINE due to
+echo                     locality bias. The index is briefly unavailable while
+echo                     being recreated. Safe for clones / outage windows;
+echo                     do NOT pass this in prod with concurrent users.
 echo   --drop-pkg        Drop the PL/SQL package after execution
 echo   --drop-logs       Drop purge log tables (epf_purge_log, epf_purge_space_snapshot)
 echo   --truncate-logs   Clear all purge run history before starting (keeps tables)

@@ -37,6 +37,7 @@ DRY_RUN="N"
 RECLAIM_SPACE="N"
 RECLAIM_ONLY="N"
 SKIP_STALL_CHECKS="N"
+ALLOW_OFFLINE_IDX="N"
 OPTIMIZE_DB="N"
 SYS_PASSWORD=""
 ASSUME_YES="N"
@@ -91,6 +92,7 @@ parse_args() {
             --reclaim-online)      RECLAIM_SPACE="Y"; shift ;;  # legacy alias
             --reclaim-online-only) RECLAIM_ONLY="Y"; RECLAIM_SPACE="Y"; shift ;;  # legacy alias
             --no-stall-check) SKIP_STALL_CHECKS="Y"; shift ;;
+            --allow-offline-index-rebuild) ALLOW_OFFLINE_IDX="Y"; shift ;;
             --optimize-db)  OPTIMIZE_DB="Y"; shift ;;
             --sys-password) SYS_PASSWORD="$2"; shift 2 ;;
             --assume-yes|-y) ASSUME_YES="Y"; shift ;;
@@ -135,6 +137,7 @@ load_config() {
                 DRY_RUN)            DRY_RUN="$value" ;;
                 RECLAIM_SPACE)      RECLAIM_SPACE="$value" ;;
                 SKIP_STALL_CHECKS)  SKIP_STALL_CHECKS="$value" ;;
+                ALLOW_OFFLINE_IDX)  ALLOW_OFFLINE_IDX="$value" ;;
                 DROP_PACKAGE_AFTER) DROP_PACKAGE_AFTER="$value" ;;
                 MAX_ITERATIONS)     MAX_ITERATIONS="$value" ;;
             esac
@@ -181,6 +184,12 @@ Options:
                     capped at 20000. Wrapper recommends a value based on the
                     OPPAYMENTS tablespace datafile size queried at startup.
   --no-stall-check  Disable stall detection during reclaim (always run all iterations)
+  --allow-offline-index-rebuild
+                    Permit DROP+CREATE INDEX fallback when an index refuses to
+                    relocate via REBUILD ONLINE due to Oracle's locality bias.
+                    The index is briefly unavailable while being recreated.
+                    Safe for clones / outage windows; do NOT pass in prod with
+                    concurrent users.
   --drop-pkg        Drop the PL/SQL package after execution
   --drop-logs       Drop purge log tables (epf_purge_log, epf_purge_space_snapshot)
   --truncate-logs   Clear all purge run history before starting (keeps tables)
@@ -908,7 +917,13 @@ SQLEOF
             log_warn "  --"
             log_warn "  Re-run reclaim (you'll be prompted for the SYS password):"
             log_warn "    bin/epf_purge.sh --tns ${TNS_NAME} --reclaim-only \\"
-            log_warn "      --max-iterations ${current_max} --no-stall-check"
+            log_warn "      --max-iterations ${current_max} --no-stall-check \\"
+            log_warn "      --allow-offline-index-rebuild"
+            log_warn "  --"
+            log_warn "  The --allow-offline-index-rebuild flag enables a DROP+CREATE"
+            log_warn "  fallback for indexes stuck near the HWM due to Oracle's"
+            log_warn "  REBUILD ONLINE locality bias. The index is briefly unavailable"
+            log_warn "  during recreation; only safe for clones / outage windows."
             log_warn "============================================================"
         fi
     fi
@@ -1001,11 +1016,11 @@ execute_reclaim_online() {
         sys_connect="${SYS_USER}/${SYS_PASSWORD}@${TNS_NAME}"
     fi
 
-    # Positional args: target_pct_free, max_iterations, skip_stall_checks
+    # Positional args: target_pct_free, max_iterations, skip_stall_checks, allow_offline_idx
     local effective_max_iter="${MAX_ITERATIONS:-${EPF_RECOMMENDED_MAX_ITER:-2000}}"
-    log_info "Reclaim parameters: target_pct_free=10, max_iterations=${effective_max_iter}, skip_stall_checks=${SKIP_STALL_CHECKS}"
+    log_info "Reclaim parameters: target_pct_free=10, max_iterations=${effective_max_iter}, skip_stall_checks=${SKIP_STALL_CHECKS}, allow_offline_idx=${ALLOW_OFFLINE_IDX}"
     sqlplus -S "${sys_connect}" <<SQLEOF 2>&1 | tee -a "$LOG_FILE"
-@${SQL_DIR}/05_reclaim_tablespace.sql 10 ${effective_max_iter} ${SKIP_STALL_CHECKS}
+@${SQL_DIR}/05_reclaim_tablespace.sql 10 ${effective_max_iter} ${SKIP_STALL_CHECKS} ${ALLOW_OFFLINE_IDX}
 EXIT;
 SQLEOF
     local sqlplus_exit=${PIPESTATUS[0]}
@@ -1076,6 +1091,7 @@ main() {
     if [[ "${RECLAIM_SPACE^^}" == "Y" ]]; then
         log_info "  Max Iterations: ${MAX_ITERATIONS:-${EPF_RECOMMENDED_MAX_ITER:-2000}}"
         log_info "  Skip Stall:     $SKIP_STALL_CHECKS"
+        log_info "  Offline Idx:    $ALLOW_OFFLINE_IDX"
     fi
     log_info "  Drop Package:   $DROP_PACKAGE_AFTER"
     log_info "  Truncate Logs:  $TRUNCATE_LOGS"

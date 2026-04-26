@@ -34,3 +34,10 @@ DROP_PACKAGE_AFTER=N
 # based on tablespace datafile size: max(2000, 50 * datafile_gb), capped 20000.
 # Override with a fixed value if you want a tight cap.
 # MAX_ITERATIONS=
+
+# Allow DROP+CREATE INDEX fallback when an index refuses to relocate via
+# REBUILD ONLINE (locality bias around the HWM keeps the new copy near the
+# old one). The index is briefly unavailable while being recreated. Set to
+# Y for clone reclaims and outage windows; leave N for prod with concurrent
+# users.
+ALLOW_OFFLINE_IDX=N

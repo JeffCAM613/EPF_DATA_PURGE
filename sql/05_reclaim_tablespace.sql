@@ -30,6 +30,12 @@
 --   &2  = max_iterations   - safety limit to prevent infinite loops (default 2000)
 --   &3  = skip_stall_checks - set to Y to disable stall detection and always
 --                             run all max_iterations (default N)
+--   &4  = allow_offline_idx - set to Y to allow DROP+CREATE INDEX fallback when
+--                             a stuck INDEX refuses to relocate via REBUILD
+--                             ONLINE. The index is briefly unavailable while
+--                             being recreated (queries fall back to full scan,
+--                             FK enforcement slows). Safe for clones / outage
+--                             windows; default N for prod safety.
 -- ============================================================================
 
 -- DBMS_OUTPUT is suppressed because the entire reclaim runs as one big
@@ -44,21 +50,23 @@ SET FEEDBACK OFF
 SET VERIFY OFF
 
 -- Accept parameters via positional args. Wrapper scripts always pass all
--- three; ad-hoc invocations can use:
---   @05_reclaim_tablespace.sql 10 2000 N
+-- four; ad-hoc invocations can use:
+--   @05_reclaim_tablespace.sql 10 2000 N N
 -- (Previously this section did `DEFINE x = literal` which silently
 --  overrode any wrapper-pre-DEFINE -- the wrapper's --no-stall-check and
 --  --max-iterations had no effect. Switching to positional bindings
 --  fixes that.)
-DEFINE target_pct_free   = &1
-DEFINE max_iterations    = &2
-DEFINE skip_stall_checks = &3
+DEFINE target_pct_free      = &1
+DEFINE max_iterations       = &2
+DEFINE skip_stall_checks    = &3
+DEFINE allow_offline_idx    = &4
 
 DECLARE
     -- Configuration
     c_target_pct_free    CONSTANT NUMBER  := &target_pct_free;
     c_max_iterations     CONSTANT NUMBER  := &max_iterations;
     c_skip_stall_checks  CONSTANT BOOLEAN := UPPER('&skip_stall_checks') = 'Y';
+    c_allow_offline_idx  CONSTANT BOOLEAN := UPPER('&allow_offline_idx') = 'Y';
     c_safety_margin_mb   CONSTANT NUMBER  := 50;   -- MB above HWM for resize ceiling
     c_stall_check_every  CONSTANT NUMBER  := 100;  -- check progress every N iterations
     c_stall_min_drop_gb  CONSTANT NUMBER  := 0;    -- any progress at all resets the counter
@@ -114,13 +122,27 @@ DECLARE
     -- iterations per (owner, segment_name) and quarantining after
     -- c_max_same_seg_retries lets the loop fall through to the
     -- next-highest segment instead of looping pointlessly.
+    --
+    -- v_best_hwm_for_seg tracks the LOWEST HWM observed while this segment
+    -- was top. The original code reset the retry counter on any iteration
+    -- where HWM dropped (`v_new_hwm_gb < v_hwm_gb`), which meant a 32 MB
+    -- oscillation -- where the index ping-pongs between two free slots near
+    -- the top -- looked like progress and wiped the counter every other
+    -- iteration. Net HWM movement was zero but the counter never reached
+    -- the quarantine threshold. Tracking *strict* improvement against the
+    -- best-ever HWM for this segment fixes that: only a real downward step
+    -- below the best counts as progress.
     TYPE t_skip_set IS TABLE OF VARCHAR2(1) INDEX BY VARCHAR2(257);
     v_skip_segments        t_skip_set;
     v_seg_key              VARCHAR2(257);
     v_last_seg_key         VARCHAR2(257) := NULL;
     v_same_seg_count       NUMBER := 0;
+    v_best_hwm_for_seg     NUMBER := NULL;  -- lowest HWM observed while this seg was top
     c_max_same_seg_retries CONSTANT NUMBER := 3;
     v_top_found            BOOLEAN;
+    v_offline_rebuilt      NUMBER := 0;     -- count of DROP+CREATE rebuilds done
+    v_idx_ddl              CLOB;
+    v_idx_ddl_ok           BOOLEAN;
 
     -- run_id of the current purge run (for log entries)
     v_run_id           RAW(16) := NULL;
@@ -258,7 +280,8 @@ BEGIN
         || ', Datafile=' || v_initial_df_gb || 'GB'
         || ', HWM=' || ROUND(v_hwm_gb, 4) || 'GB'
         || ', Used=' || v_used_gb || 'GB'
-        || ', Max iterations=' || c_max_iterations);
+        || ', Max iterations=' || c_max_iterations
+        || ', Offline-idx-rebuild=' || CASE WHEN c_allow_offline_idx THEN 'Y' ELSE 'N' END);
 
     DBMS_OUTPUT.PUT_LINE('============================================================');
     DBMS_OUTPUT.PUT_LINE('  EPF ONLINE TABLESPACE RECLAIM');
@@ -271,6 +294,7 @@ BEGIN
     DBMS_OUTPUT.PUT_LINE('  Used space:     ' || v_used_gb || ' GB');
     DBMS_OUTPUT.PUT_LINE('  Max iterations: ' || c_max_iterations);
     DBMS_OUTPUT.PUT_LINE('  Stall checks:   ' || CASE WHEN c_skip_stall_checks THEN 'DISABLED (will run all ' || c_max_iterations || ' iterations)' ELSE 'ENABLED (exit after ' || c_max_stalls || ' consecutive stalls)' END);
+    DBMS_OUTPUT.PUT_LINE('  Offline idx:    ' || CASE WHEN c_allow_offline_idx THEN 'ALLOWED (DROP+CREATE INDEX fallback for stuck indexes)' ELSE 'DISALLOWED (REBUILD ONLINE only; quarantine on stuck)' END);
     DBMS_OUTPUT.PUT_LINE('============================================================');
 
     -- ========================================================================
@@ -655,44 +679,115 @@ BEGIN
         END IF;
 
         <<next_iteration>>
-        -- Check if HWM actually dropped
+        -- Check if HWM actually dropped, and detect oscillation.
+        --
+        -- The detection logic compares against the LOWEST HWM observed while
+        -- this segment was top, NOT against last iteration's HWM. Reason:
+        -- when REBUILD ONLINE has only tiny free slots near the top (locality
+        -- bias keeps the new copy near the old one), the index ping-pongs
+        -- between two slots a few MB apart. Every other iteration LOOKS like
+        -- a drop but is fully undone next iteration. Tracking the floor
+        -- (best HWM ever seen with this seg as top) means a fake "drop" that
+        -- doesn't go below the floor counts as no-progress, not progress.
         v_new_hwm_gb := get_hwm_gb;
         v_seg_key := v_seg_owner || '.' || v_seg_name;
-        IF v_new_hwm_gb >= v_hwm_gb THEN
-            DBMS_OUTPUT.PUT_LINE('       HWM unchanged (' || ROUND(v_new_hwm_gb, 4)
-                || ' GB). Will retry with tighter ceiling.');
-            -- Track consecutive no-progress iterations on the same segment.
-            -- If the same segment is the top and HWM doesn't budge for
-            -- c_max_same_seg_retries iterations in a row, quarantine it
-            -- so subsequent iterations pick the next-highest segment.
-            IF v_seg_key = v_last_seg_key THEN
-                v_same_seg_count := v_same_seg_count + 1;
-            ELSE
-                v_same_seg_count := 1;
-                v_last_seg_key   := v_seg_key;
+
+        IF v_seg_key != NVL(v_last_seg_key, '~') THEN
+            -- Switched to a different top segment. Start fresh tracking.
+            v_last_seg_key     := v_seg_key;
+            v_best_hwm_for_seg := v_new_hwm_gb;
+            v_same_seg_count   := 0;
+            DBMS_OUTPUT.PUT_LINE('       HWM now ' || ROUND(v_new_hwm_gb, 4)
+                || ' GB (new top segment).');
+        ELSIF v_new_hwm_gb < v_best_hwm_for_seg THEN
+            -- Real progress: strictly below the best-ever HWM for this seg.
+            DBMS_OUTPUT.PUT_LINE('       HWM dropped: '
+                || ROUND(v_best_hwm_for_seg, 4) || ' -> '
+                || ROUND(v_new_hwm_gb, 4) || ' GB (new floor for this seg)');
+            v_best_hwm_for_seg := v_new_hwm_gb;
+            v_same_seg_count   := 0;
+        ELSE
+            -- No real progress: HWM is at or above the best-ever floor for
+            -- this seg. Could be flat (== best) or oscillating (briefly
+            -- below best then back up). Either way, count it as a stuck
+            -- iteration.
+            DBMS_OUTPUT.PUT_LINE('       HWM ' || ROUND(v_new_hwm_gb, 4)
+                || ' GB (no improvement vs floor '
+                || ROUND(v_best_hwm_for_seg, 4) || '). Stuck count = '
+                || (v_same_seg_count + 1) || '/' || c_max_same_seg_retries);
+            v_same_seg_count := v_same_seg_count + 1;
+        END IF;
+
+        -- Threshold reached: try escalating fallback before quarantining.
+        IF v_same_seg_count >= c_max_same_seg_retries THEN
+            v_idx_ddl_ok := FALSE;
+
+            -- DROP+CREATE INDEX fallback (only for indexes, only if allowed).
+            -- REBUILD ONLINE has a strong locality bias: while the old copy
+            -- exists, Oracle allocates the new copy near it. DROP+CREATE
+            -- removes the old copy first, so CREATE allocates from the
+            -- lowest free space in the tablespace and lands well below the
+            -- HWM in most cases. Cost: brief unavailability of this index.
+            IF c_allow_offline_idx AND v_seg_type = 'INDEX' THEN
+                BEGIN
+                    -- Capture the index DDL. SQLTERMINATOR defaults to
+                    -- FALSE, so the captured DDL has no trailing ';' --
+                    -- safe to feed straight to EXECUTE IMMEDIATE.
+                    SELECT DBMS_METADATA.GET_DDL('INDEX', v_seg_name, v_seg_owner)
+                      INTO v_idx_ddl
+                      FROM dual;
+                    v_idx_ddl := RTRIM(v_idx_ddl, CHR(10) || CHR(13) || CHR(9) || ' ');
+
+                    EXECUTE IMMEDIATE 'DROP INDEX ' || v_seg_owner || '.' || v_seg_name;
+                    EXECUTE IMMEDIATE v_idx_ddl;
+
+                    v_idx_ddl_ok      := TRUE;
+                    v_offline_rebuilt := v_offline_rebuilt + 1;
+
+                    reclaim_log('SQUEEZE_PROGRESS', 'INFO',
+                        'Stuck index ' || v_seg_key
+                        || ' rebuilt via DROP+CREATE (REBUILD ONLINE could'
+                        || ' not relocate it due to locality bias). Floor'
+                        || ' was ' || ROUND(v_best_hwm_for_seg, 4)
+                        || 'GB. Continuing.',
+                        ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+
+                    -- Reset tracking; the next iteration will pick the new
+                    -- top (might still be this index if it landed only
+                    -- slightly lower, but with a new floor to beat).
+                    v_same_seg_count   := 0;
+                    v_last_seg_key     := NULL;
+                    v_best_hwm_for_seg := NULL;
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        reclaim_log('SQUEEZE_PROGRESS', 'WARNING',
+                            'DROP+CREATE fallback failed for ' || v_seg_key
+                            || ': ' || SUBSTR(SQLERRM, 1, 200)
+                            || '. Quarantining instead.',
+                            ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+                END;
             END IF;
-            IF v_same_seg_count >= c_max_same_seg_retries THEN
+
+            -- Quarantine if no fallback succeeded.
+            IF NOT v_idx_ddl_ok THEN
                 v_skip_segments(v_seg_key) := 'Y';
                 reclaim_log('SQUEEZE_PROGRESS', 'WARNING',
                     'Quarantining ' || v_seg_key || ' (' || v_seg_type
                     || ') after ' || c_max_same_seg_retries
-                    || ' consecutive no-progress iterations. ONLINE rebuild'
-                    || ' is not relocating it (likely concurrent workload'
-                    || ' or a non-relocatable segment property). Skipping'
-                    || ' for the rest of this run; falling through to the'
-                    || ' next-highest segment.',
+                    || ' no-progress iterations (floor='
+                    || ROUND(v_best_hwm_for_seg, 4) || 'GB). REBUILD ONLINE'
+                    || ' is not relocating it (likely locality bias or a'
+                    || ' non-relocatable property).'
+                    || CASE WHEN v_seg_type = 'INDEX' AND NOT c_allow_offline_idx
+                            THEN ' Re-run with --allow-offline-index-rebuild'
+                                 || ' to enable the DROP+CREATE fallback.'
+                            ELSE '' END
+                    || ' Falling through to next-highest segment.',
                     ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
-                v_same_seg_count := 0;
-                v_last_seg_key   := NULL;
+                v_same_seg_count   := 0;
+                v_last_seg_key     := NULL;
+                v_best_hwm_for_seg := NULL;
             END IF;
-        ELSE
-            DBMS_OUTPUT.PUT_LINE('       HWM dropped: ' || ROUND(v_hwm_gb, 4)
-                || ' -> ' || ROUND(v_new_hwm_gb, 4) || ' GB');
-            -- Any HWM progress resets the per-segment retry counter so
-            -- a segment that drops once and re-tops later still gets
-            -- a fresh c_max_same_seg_retries chances.
-            v_same_seg_count := 0;
-            v_last_seg_key   := NULL;
         END IF;
 
         -- Stall detection: every N iterations, check if meaningful progress was made
@@ -769,6 +864,8 @@ BEGIN
     DBMS_OUTPUT.PUT_LINE('    Iterations:     ' || v_iteration);
     DBMS_OUTPUT.PUT_LINE('    HWM:            ' || ROUND(v_initial_hwm_gb, 4)
         || ' GB -> ' || ROUND(v_hwm_gb, 4) || ' GB');
+    DBMS_OUTPUT.PUT_LINE('    Offline idx rebuilds: ' || v_offline_rebuilt);
+    DBMS_OUTPUT.PUT_LINE('    Quarantined seg:      ' || v_skip_segments.COUNT);
     DBMS_OUTPUT.PUT_LINE('  Datafile:');
     DBMS_OUTPUT.PUT_LINE('    Before:         ' || v_initial_df_gb || ' GB');
 
