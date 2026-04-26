@@ -23,6 +23,10 @@
 # ============================================================================
 
 set -u
+# pipefail makes "$?" after `run_sqlplus ... | tr ...` reflect the sqlplus
+# exit code (e.g. 124 for `timeout`-killed) rather than tr's. Required for
+# note_poll_result to correctly detect stalled polls.
+set -o pipefail
 
 CONN_STR="${1:-}"
 POLL_SEC="${2:-10}"
@@ -41,6 +45,53 @@ write_log() {
     echo "$1"
     if [[ -n "$LOG_FILE" ]]; then
         echo "$1" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+# Per-poll sqlplus timeout in seconds. Bounds the worst-case polling stall: a
+# single stalled sqlplus call (blocked session, network blip, hung query) gets
+# killed after this many seconds and the loop retries on the next interval,
+# instead of freezing the monitor indefinitely.
+POLL_TIMEOUT_SEC=60
+
+# Resolve a "timeout" command if available (coreutils on Linux, gtimeout on
+# macOS via brew install coreutils). When neither is present, fall back to a
+# transparent no-op so the monitor still works -- it just loses the timeout
+# protection on that platform.
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+else
+    TIMEOUT_CMD=""
+fi
+
+# Wrap sqlplus with timeout + -L. -L makes sqlplus exit on logon failure
+# instead of re-prompting on stdin (which would hang forever since we feed
+# it a here-doc and never reopen its stdin).
+run_sqlplus() {
+    local conn="$1"
+    if [[ -n "$TIMEOUT_CMD" ]]; then
+        $TIMEOUT_CMD "$POLL_TIMEOUT_SEC" sqlplus -L -S "$conn"
+    else
+        sqlplus -L -S "$conn"
+    fi
+}
+
+# Track consecutive timeouts so a stuck sqlplus produces a visible warning
+# rather than a silent gap in the live log.
+consecutive_timeouts=0
+note_poll_result() {
+    local rc="$1"
+    local context="$2"
+    # exit 124 = timeout(1) killed the child; treat all non-zero as a failed poll
+    if [[ "$rc" -ne 0 ]]; then
+        consecutive_timeouts=$((consecutive_timeouts + 1))
+        if (( consecutive_timeouts == 1 )) || (( consecutive_timeouts % 5 == 0 )); then
+            write_log "[MONITOR] WARN: sqlplus poll failed (rc=$rc, ${context}, consecutive=${consecutive_timeouts}). Retrying next interval."
+        fi
+    else
+        consecutive_timeouts=0
     fi
 }
 
@@ -69,7 +120,7 @@ while [[ $done_flag -eq 0 ]]; do
     # completed old run, replaying its RECLAIM_END / ERROR, and exiting
     # before the current run even begins.
     if [[ $found_run -eq 0 ]]; then
-        run_id=$(sqlplus -S "$CONN_STR" <<ENDSQL 2>/dev/null | tr -d '[:space:]'
+        run_id=$(run_sqlplus "$CONN_STR" <<ENDSQL 2>/dev/null | tr -d '[:space:]'
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300 TRIMOUT ON TRIMSPOOL ON
 SELECT RAWTOHEX(run_id) FROM (
     SELECT run_id FROM oppayments.epf_purge_log
@@ -89,6 +140,7 @@ SELECT RAWTOHEX(run_id) FROM (
 EXIT;
 ENDSQL
         )
+        note_poll_result "$?" "discover-run-id"
         if [[ -n "$run_id" && ${#run_id} -ge 16 ]]; then
             found_run=1
             idle_since=$(date +%s)
@@ -106,7 +158,7 @@ ENDSQL
     # Fetch new log entries since last_log_id
     # ------------------------------------------------------------------------
     if [[ $found_run -eq 1 ]]; then
-        output=$(sqlplus -S "$CONN_STR" <<ENDSQL 2>/dev/null
+        output=$(run_sqlplus "$CONN_STR" <<ENDSQL 2>/dev/null
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500 TRIMOUT ON TRIMSPOOL ON
 SELECT log_id || '|' ||
        TO_CHAR(log_timestamp, 'HH24:MI:SS') || '|' ||
@@ -125,6 +177,7 @@ ORDER BY log_id;
 EXIT;
 ENDSQL
         )
+        note_poll_result "$?" "fetch-new-log-entries"
 
         any_new=0
         while IFS='|' read -r log_id ts module operation batch_num rows_aff status message elapsed tbl_name; do
@@ -208,7 +261,7 @@ ENDSQL
         # or for a run that already completed while we were not looking.
         # --------------------------------------------------------------------
         if [[ $any_new -eq 0 && $last_log_id -gt 0 && $done_flag -eq 0 ]]; then
-            latest_id=$(sqlplus -S "$CONN_STR" <<'ENDSQL' 2>/dev/null | tr -d '[:space:]'
+            latest_id=$(run_sqlplus "$CONN_STR" <<'ENDSQL' 2>/dev/null | tr -d '[:space:]'
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300 TRIMOUT ON TRIMSPOOL ON
 SELECT RAWTOHEX(run_id) FROM (
     SELECT run_id FROM oppayments.epf_purge_log
@@ -218,6 +271,7 @@ SELECT RAWTOHEX(run_id) FROM (
 EXIT;
 ENDSQL
             )
+            note_poll_result "$?" "recheck-latest-run-id"
             if [[ -n "$latest_id" && ${#latest_id} -ge 16 && "$latest_id" != "$run_id" ]]; then
                 write_log ""
                 write_log "[MONITOR] Newer run detected: $latest_id (was $run_id)"
@@ -228,7 +282,7 @@ ENDSQL
                 idle_since=$(date +%s)
             else
                 # Same run -- did we miss completion?
-                end_count=$(sqlplus -S "$CONN_STR" <<ENDSQL 2>/dev/null | tr -d '[:space:]'
+                end_count=$(run_sqlplus "$CONN_STR" <<ENDSQL 2>/dev/null | tr -d '[:space:]'
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 50 TRIMOUT ON TRIMSPOOL ON
 SELECT COUNT(*) FROM oppayments.epf_purge_log
 WHERE run_id = HEXTORAW('${run_id}')
@@ -236,6 +290,7 @@ WHERE run_id = HEXTORAW('${run_id}')
 EXIT;
 ENDSQL
                 )
+                note_poll_result "$?" "check-end-marker"
                 if [[ -n "$end_count" && "$end_count" -gt 0 ]]; then
                     done_flag=1
                 fi

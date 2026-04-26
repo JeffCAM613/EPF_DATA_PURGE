@@ -87,12 +87,19 @@ DECLARE
     v_has_lobs         NUMBER;
     v_shrink_count     NUMBER := 0;
     v_shrink_errors    NUMBER := 0;
-    v_shrink_last_logged_count NUMBER := 0;       -- progress-log throttling
+    v_shrink_iter_seen        NUMBER := 0;        -- iterations entered (for cadence)
+    v_shrink_last_logged_iter NUMBER := 0;        -- iter# of the last cadence log
+    v_shrink_last_log_ts      TIMESTAMP;          -- wall-time of the last cadence log
+    v_shrink_total_tables     NUMBER := 0;        -- total tables to shrink (for X/Y display)
     c_shrink_log_every_n  CONSTANT NUMBER := 10;  -- log SHRINK_PROGRESS every N tables
-    -- No wallclock floor: when a single SHRINK SPACE CASCADE blocks the loop
-    -- body for many minutes, no throttle check fires anyway (the check is
-    -- between iterations). A wallclock floor only adds noise during fast
-    -- iterations; per-N-tables cadence is the only useful knob here.
+    c_shrink_log_max_secs CONSTANT NUMBER := 30;  -- ...or every N seconds, whichever is sooner
+    -- The cadence log fires BEFORE each SHRINK SPACE CASCADE (with the
+    -- in-flight table name) rather than after. This way, if a single SHRINK
+    -- statement takes many minutes (common for tables with heavy LOB segments
+    -- under high retention), the monitor's last visible line names the table
+    -- currently being processed -- the user can verify progress via
+    -- v$session_longops / dba_segments instead of assuming the run is hung.
+    -- The wallclock floor (30s) bounds the silent gap between cadence logs.
     v_checkpoint_hwm   NUMBER := NULL;
     v_stall_count      NUMBER := 0;  -- consecutive stall checkpoints
     v_started          TIMESTAMP := SYSTIMESTAMP;
@@ -265,6 +272,23 @@ BEGIN
     DBMS_OUTPUT.PUT_LINE('');
     DBMS_OUTPUT.PUT_LINE('=== Phase 1: SHRINK SPACE (compacting segments) ===');
 
+    -- Pre-count the table set so progress logs can show "X of Y processed".
+    -- Filter MUST mirror the FOR loop's WHERE clause exactly.
+    SELECT COUNT(*) INTO v_shrink_total_tables
+    FROM dba_tables
+    WHERE tablespace_name = v_tablespace
+      AND temporary = 'N'
+      AND secondary = 'N'
+      AND iot_type IS NULL
+      AND table_name NOT IN ('EPF_PURGE_LOG', 'EPF_PURGE_SPACE_SNAPSHOT');
+
+    -- Force the very first iteration to fire a cadence log by setting the
+    -- wallclock baseline far in the past. Without this, iter 1 only logs
+    -- when 10 tables have already been processed -- meaning the user could
+    -- wait through the first 10 SHRINK SPACE CASCADE calls (potentially many
+    -- minutes apiece) before seeing any output.
+    v_shrink_last_log_ts := SYSTIMESTAMP - INTERVAL '1' HOUR;
+
     FOR tbl IN (
         SELECT owner, table_name
         FROM dba_tables
@@ -278,6 +302,29 @@ BEGIN
           AND table_name NOT IN ('EPF_PURGE_LOG', 'EPF_PURGE_SPACE_SNAPSHOT')
         ORDER BY owner, table_name
     ) LOOP
+        v_shrink_iter_seen := v_shrink_iter_seen + 1;
+
+        -- Pre-shrink heartbeat: log BEFORE the SHRINK starts so the monitor's
+        -- last visible line always names the table currently in flight.
+        -- Fires when EITHER cadence-N tables passed since last log, OR
+        -- wallclock floor exceeded -- whichever comes first. The first
+        -- iteration always fires (last_log_ts initialised in the past).
+        IF v_shrink_iter_seen - v_shrink_last_logged_iter >= c_shrink_log_every_n
+           OR (CAST(SYSTIMESTAMP AS DATE) - CAST(v_shrink_last_log_ts AS DATE)) * 86400
+                  >= c_shrink_log_max_secs
+        THEN
+            reclaim_log('SHRINK_PROGRESS', 'INFO',
+                'Shrinking ' || tbl.owner || '.' || tbl.table_name
+                || ' (' || (v_shrink_iter_seen - 1) || '/' || v_shrink_total_tables
+                || ' processed; ' || v_shrink_count || ' done, '
+                || v_shrink_errors || ' skipped). If this line stays visible '
+                || 'for several minutes, a single SHRINK SPACE CASCADE is in '
+                || 'progress -- monitor reports nothing until it finishes.',
+                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+            v_shrink_last_logged_iter := v_shrink_iter_seen;
+            v_shrink_last_log_ts := SYSTIMESTAMP;
+        END IF;
+
         BEGIN
             -- Enable row movement (required for SHRINK)
             EXECUTE IMMEDIATE
@@ -298,19 +345,6 @@ BEGIN
                 DBMS_OUTPUT.PUT_LINE('  SHRINK SKIP: ' || tbl.owner || '.' || tbl.table_name
                     || ' (' || SQLERRM || ')');
         END;
-
-        -- Live SHRINK_PROGRESS to epf_purge_log for the monitor.
-        -- Fires every N tables (success + skip combined). No wallclock floor.
-        IF (v_shrink_count + v_shrink_errors)
-                - v_shrink_last_logged_count >= c_shrink_log_every_n
-        THEN
-            reclaim_log('SHRINK_PROGRESS', 'INFO',
-                'Shrunk ' || v_shrink_count || ' tables'
-                || ' (skipped ' || v_shrink_errors || '),'
-                || ' last: ' || tbl.owner || '.' || tbl.table_name,
-                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
-            v_shrink_last_logged_count := v_shrink_count + v_shrink_errors;
-        END IF;
     END LOOP;
 
     -- Recalculate used space and target after shrink

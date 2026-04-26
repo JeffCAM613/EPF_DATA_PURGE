@@ -742,10 +742,31 @@ if /i not "%DRY_RUN%"=="Y" (
     )
 
     echo [INFO]  Capturing post-reclaim space snapshot and comparison...
-    REM Pass the actual purge depth via DEFINE so the report only lists
-    REM modules the user actually purged.
-    > "%TEMP%\epf_space_compare.sql" echo DEFINE depth = %PURGE_DEPTH%
-    >> "%TEMP%\epf_space_compare.sql" echo @"%SQL_DIR%\09_space_compare.sql"
+    REM Bake the depth value directly into an inline anonymous PL/SQL block.
+    REM Previously this section wrote DEFINE depth + @09_space_compare.sql,
+    REM but 09_space_compare.sql contains its own DEFINE depth = ALL which
+    REM silently overwrote the wrapper's DEFINE -- so --depth was ignored and
+    REM the report always covered every module. The Linux wrapper avoids the
+    REM bug by inlining the call; we mirror that approach here.
+    > "%TEMP%\epf_space_compare.sql" echo SET SERVEROUTPUT ON SIZE UNLIMITED
+    >> "%TEMP%\epf_space_compare.sql" echo SET LINESIZE 200
+    >> "%TEMP%\epf_space_compare.sql" echo SET HEADING OFF FEEDBACK OFF
+    >> "%TEMP%\epf_space_compare.sql" echo DECLARE
+    >> "%TEMP%\epf_space_compare.sql" echo     l_run_id RAW^(16^);
+    >> "%TEMP%\epf_space_compare.sql" echo BEGIN
+    >> "%TEMP%\epf_space_compare.sql" echo     SELECT run_id INTO l_run_id FROM ^(
+    >> "%TEMP%\epf_space_compare.sql" echo         SELECT run_id FROM oppayments.epf_purge_log
+    >> "%TEMP%\epf_space_compare.sql" echo         WHERE operation = 'RUN_END'
+    >> "%TEMP%\epf_space_compare.sql" echo         ORDER BY log_timestamp DESC
+    >> "%TEMP%\epf_space_compare.sql" echo     ^) WHERE ROWNUM = 1;
+    >> "%TEMP%\epf_space_compare.sql" echo     DELETE FROM oppayments.epf_purge_space_snapshot
+    >> "%TEMP%\epf_space_compare.sql" echo     WHERE run_id = l_run_id AND snapshot_phase = 'AFTER';
+    >> "%TEMP%\epf_space_compare.sql" echo     COMMIT;
+    >> "%TEMP%\epf_space_compare.sql" echo     oppayments.epf_purge_pkg.capture_space_snapshot^(l_run_id, 'AFTER'^);
+    >> "%TEMP%\epf_space_compare.sql" echo     oppayments.epf_purge_pkg.print_space_comparison^(l_run_id, '%PURGE_DEPTH%'^);
+    >> "%TEMP%\epf_space_compare.sql" echo END;
+    >> "%TEMP%\epf_space_compare.sql" echo /
+    >> "%TEMP%\epf_space_compare.sql" echo EXIT;
     powershell -Command "& { $fs=[IO.FileStream]::new('!LOG_FILE!','Append','Write','ReadWrite'); $w=[IO.StreamWriter]::new($fs,[Text.Encoding]::UTF8); $w.AutoFlush=$true; try { sqlplus -S '!USERNAME!/!PASSWORD!@!TNS_NAME!' '@%TEMP%\epf_space_compare.sql' 2>&1 | ForEach-Object { $_; $w.WriteLine($_) } } finally { $w.Close(); $fs.Close() } }"
     del "%TEMP%\epf_space_compare.sql" >nul 2>&1
 
