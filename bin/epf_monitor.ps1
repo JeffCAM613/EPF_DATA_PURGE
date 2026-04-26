@@ -56,12 +56,42 @@ function Write-Log($msg) {
     }
 }
 
-# Sqlplus connection string with the -L flag baked in. -L makes sqlplus exit
-# on logon failure rather than re-prompting for credentials on stdin (which
-# would deadlock our pipe). All polls use this via `$sql | sqlplus -L -S ...`.
-# The pipe pattern is intentional: an earlier attempt to wrap each call in a
-# Process.Start + WaitForExit timeout reliably triggered false-positive
-# timeouts that stopped the monitor from displaying new rows entirely.
+# Helper: run sqlplus with a process-level timeout to prevent hangs.
+# The old pipe pattern ($sql | sqlplus ... 2>$null) had no timeout, so if
+# sqlplus hung (e.g. stuck on Oracle ADR / sqlnet.log file locks when another
+# sqlplus instance holds the file), the entire monitor froze until Ctrl+C.
+# Using Start-Process with file-based I/O (@file) and WaitForExit($timeout)
+# lets us kill a hung sqlplus automatically and retry on the next poll cycle.
+# An earlier Process.Start attempt used short timeouts that triggered false
+# positives; the 90 s default here is generous enough for normal SELECT polls
+# while still recovering from genuine hangs within ~1.5 poll intervals.
+function Invoke-SqlPoll {
+    param([string]$Sql, [int]$TimeoutMs = 90000)
+    $base    = Join-Path $env:TEMP "epfmon_${PID}_$(Get-Random)"
+    $sqlFile = "$base.sql"
+    $outFile = "$base.out"
+    $errFile = "$base.err"
+    try {
+        [IO.File]::WriteAllText($sqlFile, $Sql)
+        $proc = Start-Process sqlplus `
+            -ArgumentList @("-L", "-S", $script:ConnStr, "@$sqlFile") `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile `
+            -RedirectStandardError  $errFile `
+            -ErrorAction Stop
+        if (-not $proc.WaitForExit($TimeoutMs)) {
+            try { $proc.Kill(); $proc.WaitForExit(5000) } catch {}
+            Write-Log "[MONITOR] WARNING: sqlplus timed out ($([Math]::Floor($TimeoutMs/1000))s), will retry next cycle"
+            return @()
+        }
+        return @(Get-Content $outFile -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Trim() -ne "" })
+    } catch {
+        return @()
+    } finally {
+        Remove-Item $sqlFile, $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
 
 Write-Log "============================================================"
 Write-Log "  EPF PURGE - LIVE MONITOR"
@@ -108,7 +138,7 @@ SELECT RAWTOHEX(run_id) FROM (
 ) WHERE ROWNUM = 1;
 EXIT;
 "@
-        $result = ($sql | sqlplus -L -S "$ConnStr" 2>$null) | Where-Object { $_.Trim() -ne "" }
+        $result = Invoke-SqlPoll $sql
         if ($result) {
             $runId = ($result | Select-Object -First 1).Trim()
             if ($runId -and $runId.Length -ge 16) {
@@ -146,7 +176,7 @@ WHERE run_id = HEXTORAW('$runId')
 ORDER BY log_id;
 EXIT;
 "@
-        $rows = ($sql | sqlplus -L -S "$ConnStr" 2>$null) | Where-Object { $_.Trim() -ne "" }
+        $rows = Invoke-SqlPoll $sql
 
         $anyNew = $false
         foreach ($row in $rows) {
@@ -242,7 +272,7 @@ SELECT RAWTOHEX(run_id) FROM (
 ) WHERE ROWNUM = 1;
 EXIT;
 "@
-            $latestId = (($sqlRecheck | sqlplus -L -S "$ConnStr" 2>$null) | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
+            $latestId = (Invoke-SqlPoll $sqlRecheck | Select-Object -First 1)
             if ($latestId) { $latestId = $latestId.Trim() }
             if ($latestId -and $latestId.Length -ge 16 -and $latestId -ne $runId) {
                 Write-Log ""
@@ -262,7 +292,8 @@ WHERE run_id = HEXTORAW('$runId')
   AND (operation = 'RECLAIM_END' OR (module = 'ORCHESTRATOR' AND status = 'ERROR'));
 EXIT;
 "@
-                $endCount = (($sqlCheck | sqlplus -L -S "$ConnStr" 2>$null) | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1).Trim()
+                $endCount = (Invoke-SqlPoll $sqlCheck | Select-Object -First 1)
+                if ($endCount) { $endCount = $endCount.Trim() }
                 if ($endCount -and [int]$endCount -gt 0) {
                     $done = $true
                 }

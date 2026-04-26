@@ -885,9 +885,16 @@ REM Leading redirects (NOT a parenthesised group) so messages containing
 REM literal "(...)" -- e.g. "max iterations (2050) reached." piped in from
 REM 05_reclaim_tablespace.sql -- don't trip cmd's block-paren counter and
 REM produce "reached. was unexpected at this time." parser errors.
+REM
+REM 2>nul MUST come before >>"%LOG_FILE%" so stderr is already redirected to
+REM NUL when the >> open is attempted.  If the monitor process holds the log
+REM file open (FileStream ReadWrite), cmd's >> (FILE_SHARE_READ) gets a
+REM sharing violation and writes the error to handle 2.  With the old order
+REM (>>file 2>nul), handle 2 was still the console when the open failed,
+REM causing a visible "The process cannot access the file..." error.
 :log
 echo(%~1
->>"%LOG_FILE%" 2>nul echo(%~1
+2>nul >>"%LOG_FILE%" echo(%~1
 exit /b 0
 
 REM ============================================================================
