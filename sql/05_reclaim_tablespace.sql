@@ -123,21 +123,32 @@ DECLARE
     -- c_max_same_seg_retries lets the loop fall through to the
     -- next-highest segment instead of looping pointlessly.
     --
-    -- v_best_hwm_for_seg tracks the LOWEST HWM observed while this segment
-    -- was top. The original code reset the retry counter on any iteration
-    -- where HWM dropped (`v_new_hwm_gb < v_hwm_gb`), which meant a 32 MB
-    -- oscillation -- where the index ping-pongs between two free slots near
-    -- the top -- looked like progress and wiped the counter every other
-    -- iteration. Net HWM movement was zero but the counter never reached
-    -- the quarantine threshold. Tracking *strict* improvement against the
-    -- best-ever HWM for this segment fixes that: only a real downward step
-    -- below the best counts as progress.
+    -- v_seg_floors tracks the LOWEST HWM observed for each segment that has
+    -- been top, keyed by 'owner.name'. v_seg_attempts tracks the consecutive
+    -- no-progress count for each segment.
+    --
+    -- Two related bugs in the original code:
+    --
+    --   1. A single global retry counter reset every time the top segment
+    --      changed. A cluster of segments cycling as top (e.g. EPF_PURGE_LOG
+    --      and its 3 indexes, each grown by reclaim_log() inserts during
+    --      the squeeze itself) never accumulated enough on any single
+    --      member to hit the threshold. Per-segment associative arrays
+    --      fix that: each (owner.name) carries its own state across cycles.
+    --
+    --   2. Progress was measured iter-to-iter (`v_new_hwm_gb < v_hwm_gb`),
+    --      so a 32 MB oscillation -- where REBUILD ONLINE's locality bias
+    --      ping-pongs an index between two free slots near the top -- looked
+    --      like progress and wiped the counter every other iteration. Net
+    --      HWM movement was zero. Comparing against the per-segment FLOOR
+    --      (lowest HWM observed while this seg was top) fixes that: only a
+    --      real downward step below the floor counts as progress.
     TYPE t_skip_set IS TABLE OF VARCHAR2(1) INDEX BY VARCHAR2(257);
+    TYPE t_seg_num  IS TABLE OF NUMBER       INDEX BY VARCHAR2(257);
     v_skip_segments        t_skip_set;
+    v_seg_attempts         t_seg_num;        -- per-segment no-progress counter
+    v_seg_floors           t_seg_num;        -- per-segment lowest HWM observed while top
     v_seg_key              VARCHAR2(257);
-    v_last_seg_key         VARCHAR2(257) := NULL;
-    v_same_seg_count       NUMBER := 0;
-    v_best_hwm_for_seg     NUMBER := NULL;  -- lowest HWM observed while this seg was top
     c_max_same_seg_retries CONSTANT NUMBER := 3;
     v_top_found            BOOLEAN;
     v_offline_rebuilt      NUMBER := 0;     -- count of DROP+CREATE rebuilds done
@@ -431,6 +442,59 @@ BEGIN
     -- ========================================================================
     -- Step 2: Iterative squeeze loop (defragment HWM)
     -- ========================================================================
+    -- Pre-populate v_skip_segments with the reclaim's own log/snapshot tables
+    -- and every dependent segment they own (indexes + LOBs). MOVE/REBUILD on
+    -- these creates a feedback loop because reclaim_log() inserts a row every
+    -- iteration -- the segment re-extends near the HWM immediately after
+    -- being moved, then becomes top again on the next iteration. With the
+    -- log table, its 3 indexes, the snapshot table and its index cycling as
+    -- "top", no single segment is consecutively top long enough to hit the
+    -- per-segment retry threshold, so the squeeze ran forever for zero net
+    -- HWM movement. Excluding them up front lets the squeeze focus on real
+    -- top segments. The SHRINK phase already excludes these tables for the
+    -- same reason (see the SELECT in the FOR tbl IN ... LOOP earlier).
+    DECLARE
+        v_excluded_count NUMBER := 0;
+    BEGIN
+        FOR rec IN (
+            -- The two tables themselves
+            SELECT 'OPPAYMENTS' AS owner, table_name AS seg_name
+              FROM dba_tables
+             WHERE owner = 'OPPAYMENTS'
+               AND table_name IN ('EPF_PURGE_LOG', 'EPF_PURGE_SPACE_SNAPSHOT')
+            UNION ALL
+            -- All indexes (including PK / UK constraint indexes)
+            SELECT owner, index_name
+              FROM dba_indexes
+             WHERE table_owner = 'OPPAYMENTS'
+               AND table_name IN ('EPF_PURGE_LOG', 'EPF_PURGE_SPACE_SNAPSHOT')
+            UNION ALL
+            -- LOB segments + LOB indexes for any CLOB/BLOB columns
+            SELECT owner, segment_name
+              FROM dba_lobs
+             WHERE owner = 'OPPAYMENTS'
+               AND table_name IN ('EPF_PURGE_LOG', 'EPF_PURGE_SPACE_SNAPSHOT')
+            UNION ALL
+            SELECT owner, index_name
+              FROM dba_lobs
+             WHERE owner = 'OPPAYMENTS'
+               AND table_name IN ('EPF_PURGE_LOG', 'EPF_PURGE_SPACE_SNAPSHOT')
+        ) LOOP
+            v_skip_segments(rec.owner || '.' || rec.seg_name) := 'Y';
+            v_excluded_count := v_excluded_count + 1;
+        END LOOP;
+
+        IF v_excluded_count > 0 THEN
+            reclaim_log('SQUEEZE_PROGRESS', 'INFO',
+                'Pre-excluded ' || v_excluded_count || ' purge-log/snapshot'
+                || ' segments from squeeze (active write target during'
+                || ' reclaim -- moving them creates a feedback loop).',
+                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+            DBMS_OUTPUT.PUT_LINE('  Pre-excluded ' || v_excluded_count
+                || ' log/snapshot segments from squeeze.');
+        END IF;
+    END;
+
     DBMS_OUTPUT.PUT_LINE('=== Phase 2: SQUEEZE (lowering HWM from '
         || ROUND(v_hwm_gb, 4) || ' to ' || ROUND(v_target_hwm_gb, 4) || ' GB) ===');
 
@@ -679,47 +743,50 @@ BEGIN
         END IF;
 
         <<next_iteration>>
-        -- Check if HWM actually dropped, and detect oscillation.
+        -- Check if HWM actually dropped, and detect oscillation / cycling.
         --
-        -- The detection logic compares against the LOWEST HWM observed while
-        -- this segment was top, NOT against last iteration's HWM. Reason:
-        -- when REBUILD ONLINE has only tiny free slots near the top (locality
-        -- bias keeps the new copy near the old one), the index ping-pongs
-        -- between two slots a few MB apart. Every other iteration LOOKS like
-        -- a drop but is fully undone next iteration. Tracking the floor
-        -- (best HWM ever seen with this seg as top) means a fake "drop" that
-        -- doesn't go below the floor counts as no-progress, not progress.
+        -- Per-segment counters via associative arrays. Each (owner.name) key
+        -- has its own attempt counter and "best HWM floor" -- so a cluster
+        -- of segments cycling as top (e.g. a heavily-fragmented family of
+        -- small indexes) still accumulates per-segment counters across
+        -- iterations and gets quarantined / DROP+CREATE'd correctly. A
+        -- single global counter would reset every time the top changed
+        -- between cycle members, never reaching the threshold.
+        --
+        -- The "best floor" comparison (rather than raw iter-to-iter drops)
+        -- catches oscillation: when REBUILD ONLINE has only tiny free slots
+        -- near the top (locality bias keeps the new copy near the old one),
+        -- a segment ping-pongs between two slots a few MB apart -- every
+        -- other iteration looks like a drop but is fully undone next time.
+        -- Only a strict drop below the per-segment floor counts as progress.
         v_new_hwm_gb := get_hwm_gb;
         v_seg_key := v_seg_owner || '.' || v_seg_name;
 
-        IF v_seg_key != NVL(v_last_seg_key, '~') THEN
-            -- Switched to a different top segment. Start fresh tracking.
-            v_last_seg_key     := v_seg_key;
-            v_best_hwm_for_seg := v_new_hwm_gb;
-            v_same_seg_count   := 0;
+        IF NOT v_seg_floors.EXISTS(v_seg_key) THEN
+            -- First time we've seen this segment as top. Initialise its
+            -- floor to the current HWM and zero its attempt counter.
+            v_seg_floors(v_seg_key)   := v_new_hwm_gb;
+            v_seg_attempts(v_seg_key) := 0;
             DBMS_OUTPUT.PUT_LINE('       HWM now ' || ROUND(v_new_hwm_gb, 4)
-                || ' GB (new top segment).');
-        ELSIF v_new_hwm_gb < v_best_hwm_for_seg THEN
-            -- Real progress: strictly below the best-ever HWM for this seg.
+                || ' GB (first time seg is top).');
+        ELSIF v_new_hwm_gb < v_seg_floors(v_seg_key) THEN
+            -- Real progress for this segment.
             DBMS_OUTPUT.PUT_LINE('       HWM dropped: '
-                || ROUND(v_best_hwm_for_seg, 4) || ' -> '
-                || ROUND(v_new_hwm_gb, 4) || ' GB (new floor for this seg)');
-            v_best_hwm_for_seg := v_new_hwm_gb;
-            v_same_seg_count   := 0;
+                || ROUND(v_seg_floors(v_seg_key), 4) || ' -> '
+                || ROUND(v_new_hwm_gb, 4) || ' GB (new floor for ' || v_seg_key || ')');
+            v_seg_floors(v_seg_key)   := v_new_hwm_gb;
+            v_seg_attempts(v_seg_key) := 0;
         ELSE
-            -- No real progress: HWM is at or above the best-ever floor for
-            -- this seg. Could be flat (== best) or oscillating (briefly
-            -- below best then back up). Either way, count it as a stuck
-            -- iteration.
+            v_seg_attempts(v_seg_key) := v_seg_attempts(v_seg_key) + 1;
             DBMS_OUTPUT.PUT_LINE('       HWM ' || ROUND(v_new_hwm_gb, 4)
                 || ' GB (no improvement vs floor '
-                || ROUND(v_best_hwm_for_seg, 4) || '). Stuck count = '
-                || (v_same_seg_count + 1) || '/' || c_max_same_seg_retries);
-            v_same_seg_count := v_same_seg_count + 1;
+                || ROUND(v_seg_floors(v_seg_key), 4) || ' for ' || v_seg_key
+                || '). Attempt ' || v_seg_attempts(v_seg_key)
+                || '/' || c_max_same_seg_retries);
         END IF;
 
         -- Threshold reached: try escalating fallback before quarantining.
-        IF v_same_seg_count >= c_max_same_seg_retries THEN
+        IF v_seg_attempts(v_seg_key) >= c_max_same_seg_retries THEN
             v_idx_ddl_ok := FALSE;
 
             -- DROP+CREATE INDEX fallback (only for indexes, only if allowed).
@@ -748,16 +815,17 @@ BEGIN
                         'Stuck index ' || v_seg_key
                         || ' rebuilt via DROP+CREATE (REBUILD ONLINE could'
                         || ' not relocate it due to locality bias). Floor'
-                        || ' was ' || ROUND(v_best_hwm_for_seg, 4)
+                        || ' was ' || ROUND(v_seg_floors(v_seg_key), 4)
                         || 'GB. Continuing.',
                         ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
 
-                    -- Reset tracking; the next iteration will pick the new
-                    -- top (might still be this index if it landed only
-                    -- slightly lower, but with a new floor to beat).
-                    v_same_seg_count   := 0;
-                    v_last_seg_key     := NULL;
-                    v_best_hwm_for_seg := NULL;
+                    -- Clear this segment's tracking; next iteration starts
+                    -- fresh against the post-rebuild HWM. The seg may still
+                    -- be top if it landed only slightly lower, but it gets
+                    -- a fresh c_max_same_seg_retries chances against the
+                    -- new floor before being quarantined.
+                    v_seg_floors.DELETE(v_seg_key);
+                    v_seg_attempts.DELETE(v_seg_key);
                 EXCEPTION
                     WHEN OTHERS THEN
                         reclaim_log('SQUEEZE_PROGRESS', 'WARNING',
@@ -775,7 +843,7 @@ BEGIN
                     'Quarantining ' || v_seg_key || ' (' || v_seg_type
                     || ') after ' || c_max_same_seg_retries
                     || ' no-progress iterations (floor='
-                    || ROUND(v_best_hwm_for_seg, 4) || 'GB). REBUILD ONLINE'
+                    || ROUND(v_seg_floors(v_seg_key), 4) || 'GB). REBUILD ONLINE'
                     || ' is not relocating it (likely locality bias or a'
                     || ' non-relocatable property).'
                     || CASE WHEN v_seg_type = 'INDEX' AND NOT c_allow_offline_idx
@@ -784,9 +852,8 @@ BEGIN
                             ELSE '' END
                     || ' Falling through to next-highest segment.',
                     ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
-                v_same_seg_count   := 0;
-                v_last_seg_key     := NULL;
-                v_best_hwm_for_seg := NULL;
+                v_seg_floors.DELETE(v_seg_key);
+                v_seg_attempts.DELETE(v_seg_key);
             END IF;
         END IF;
 
