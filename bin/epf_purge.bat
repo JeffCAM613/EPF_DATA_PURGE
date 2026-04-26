@@ -170,6 +170,32 @@ if /i "%INTERACTIVE%"=="Y" (
         for /f "usebackq delims=" %%P in (`powershell -Command "$p = Read-Host '  Password' -AsSecureString; [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($p))"`) do set "PASSWORD=%%P"
     )
 
+    if "!SYS_PASSWORD!"=="" (
+        echo.
+        echo   SYS/DBA Password ^(optional^)
+        echo   Enables accurate tablespace sizing and is required later for
+        echo   optimize-db and space reclaim. Press Enter to skip.
+        for /f "usebackq delims=" %%P in (`powershell -Command "$p = Read-Host '  SYS password' -AsSecureString; [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($p))"`) do set "SYS_PASSWORD=%%P"
+    )
+
+    REM Apply DBA grants early so capture_module_sizes can query dba_data_files.
+    REM Uses a temp file instead of pipe to avoid delayed-expansion loss in
+    REM cmd.exe subprocesses spawned by the pipe operator.
+    if not "!SYS_PASSWORD!"=="" (
+        echo.
+        echo [INFO]  Granting DBA view access to !USERNAME!...
+        > "%TEMP%\epf_grants.sql" (
+            echo SET HEADING OFF FEEDBACK OFF
+            echo GRANT SELECT ON sys.dba_segments TO !USERNAME!;
+            echo GRANT SELECT ON sys.dba_lobs TO !USERNAME!;
+            echo GRANT SELECT ON sys.dba_data_files TO !USERNAME!;
+            echo EXIT;
+        )
+        sqlplus -S "sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA" @"%TEMP%\epf_grants.sql" >> "%LOG_FILE%" 2>&1
+        del "%TEMP%\epf_grants.sql" >nul 2>&1
+        call :log "[OK]    DBA view grants applied"
+    )
+
     echo.
     echo   Retention Period
     echo   Data older than this many days will be purged.
@@ -177,7 +203,6 @@ if /i "%INTERACTIVE%"=="Y" (
     set /p "RETENTION_INPUT=  Retention days [!RETENTION_DAYS!]: "
     if not "!RETENTION_INPUT!"=="" set "RETENTION_DAYS=!RETENTION_INPUT!"
 
-    REM Auto-capture module sizes for depth prompt + max-iter recommendation.
     REM Capture module sizes for depth prompt + max-iter recommendation.
     echo.
     echo [INFO]  Querying current data sizes...
@@ -257,7 +282,9 @@ if /i "%INTERACTIVE%"=="Y" (
         echo   Max Squeeze Iterations ^(--max-iterations^)
         echo   Each squeeze iteration relocates ONE segment near the high water
         echo   mark. Larger tablespaces typically need more iterations.
-        if defined EPF_DATAFILE_GB (
+        set "EPF_SHOW_DF=N"
+        if defined EPF_DATAFILE_GB if not "!EPF_DATAFILE_GB!"=="0" if not "!EPF_DATAFILE_GB!"=="0.00" set "EPF_SHOW_DF=Y"
+        if "!EPF_SHOW_DF!"=="Y" (
             echo   Tablespace datafile: !EPF_DATAFILE_GB! GB  -^>  recommended: !EPF_RECOMMENDED_MAX_ITER! iterations
         ) else (
             echo   Tablespace size unknown ^(no DBA grants^); defaulting to !EPF_RECOMMENDED_MAX_ITER!.
@@ -280,15 +307,13 @@ if /i "%INTERACTIVE%"=="Y" (
     )
 )
 
-REM Prompt for SYS password if optimize-db or reclaim enabled (interactive)
-if /i "%OPTIMIZE_DB%"=="Y" if "!SYS_PASSWORD!"=="" (
+REM Prompt for SYS password if optimize-db or reclaim enabled but not yet provided
+set "EPF_NEED_SYS=N"
+if /i "%OPTIMIZE_DB%"=="Y" if "!SYS_PASSWORD!"=="" set "EPF_NEED_SYS=Y"
+if /i "%RECLAIM_SPACE%"=="Y" if "!SYS_PASSWORD!"=="" set "EPF_NEED_SYS=Y"
+if "!EPF_NEED_SYS!"=="Y" (
     echo.
-    echo   SYS/DBA password ^(needed for optimize-db and/or reclaim^)
-    for /f "usebackq delims=" %%P in (`powershell -Command "$p = Read-Host '  SYS password' -AsSecureString; [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($p))"`) do set "SYS_PASSWORD=%%P"
-)
-if /i "%RECLAIM_SPACE%"=="Y" if "!SYS_PASSWORD!"=="" (
-    echo.
-    echo   SYS/DBA password ^(needed for reclaim^)
+    echo   SYS/DBA password ^(required for optimize-db / reclaim^)
     for /f "usebackq delims=" %%P in (`powershell -Command "$p = Read-Host '  SYS password' -AsSecureString; [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($p))"`) do set "SYS_PASSWORD=%%P"
 )
 
@@ -456,12 +481,15 @@ REM The space comparison needs dba_segments to match reclaim report numbers.
 REM Grants are idempotent and only run when SYS password is available.
 if not "!SYS_PASSWORD!"=="" (
     call :log "[INFO]  Granting DBA view access to !USERNAME! for space snapshots..."
-    (
+    > "%TEMP%\epf_grants.sql" (
         echo SET HEADING OFF FEEDBACK OFF
         echo GRANT SELECT ON sys.dba_segments TO !USERNAME!;
         echo GRANT SELECT ON sys.dba_lobs TO !USERNAME!;
+        echo GRANT SELECT ON sys.dba_data_files TO !USERNAME!;
         echo EXIT;
-    ) | sqlplus -S "sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA" >> "%LOG_FILE%" 2>&1
+    )
+    sqlplus -S "sys/!SYS_PASSWORD!@!TNS_NAME! AS SYSDBA" @"%TEMP%\epf_grants.sql" >> "%LOG_FILE%" 2>&1
+    del "%TEMP%\epf_grants.sql" >nul 2>&1
     call :log "[OK]    DBA view grants applied"
 )
 

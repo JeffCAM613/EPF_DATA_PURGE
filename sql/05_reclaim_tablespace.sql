@@ -317,9 +317,7 @@ BEGIN
                 'Shrinking ' || tbl.owner || '.' || tbl.table_name
                 || ' (' || (v_shrink_iter_seen - 1) || '/' || v_shrink_total_tables
                 || ' processed; ' || v_shrink_count || ' done, '
-                || v_shrink_errors || ' skipped). If this line stays visible '
-                || 'for several minutes, a single SHRINK SPACE CASCADE is in '
-                || 'progress -- monitor reports nothing until it finishes.',
+                || v_shrink_errors || ' skipped). ',
                 ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
             v_shrink_last_logged_iter := v_shrink_iter_seen;
             v_shrink_last_log_ts := SYSTIMESTAMP;

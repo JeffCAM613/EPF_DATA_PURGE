@@ -36,7 +36,7 @@ This tool **safely deletes** data older than a configurable number of days, logs
 | **Oracle SQL*Plus** | Must be installed and on your system PATH. |
 | **ORACLE_HOME** | Environment variable set to your Oracle client directory (recommended). |
 | **Database user: `oppayments`** | Needs `DELETE` on all purged tables, `CREATE TABLE`, `CREATE PROCEDURE`, `CREATE TYPE`. |
-| **DBA view grants** | For accurate space comparison: `GRANT SELECT ON sys.dba_segments TO oppayments; GRANT SELECT ON sys.dba_lobs TO oppayments;` (auto-applied when SYS password is provided). |
+| **DBA view grants** | For accurate space comparison: `GRANT SELECT ON sys.dba_segments TO oppayments; GRANT SELECT ON sys.dba_lobs TO oppayments; GRANT SELECT ON sys.dba_data_files TO oppayments;` (auto-applied when SYS password is provided). |
 | **SYS / DBA user** | Only needed for space reclamation (`--reclaim`) or DB optimization (`--optimize-db`). |
 | **Disk space** | The purge itself uses minimal disk. Space reclamation (`--reclaim`) is online and needs no extra space. |
 

@@ -1557,6 +1557,7 @@ AS
                 DBMS_OUTPUT.PUT_LINE('[SNAPSHOT] To fix, run as SYS:');
                 DBMS_OUTPUT.PUT_LINE('[SNAPSHOT]   GRANT SELECT ON sys.dba_segments TO oppayments;');
                 DBMS_OUTPUT.PUT_LINE('[SNAPSHOT]   GRANT SELECT ON sys.dba_lobs TO oppayments;');
+                DBMS_OUTPUT.PUT_LINE('[SNAPSHOT]   GRANT SELECT ON sys.dba_data_files TO oppayments;');
                 -- Fall back to user_segments / user_lobs (no DBA privileges).
                 -- USER is the owner constant; module CASE works the same way.
                 EXECUTE IMMEDIATE

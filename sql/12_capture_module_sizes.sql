@@ -129,8 +129,20 @@ BEGIN
                     ELSE NULL;
                 END CASE;
             END LOOP;
-            v_df_bytes := 0;  -- no DBA view => no datafile size
+            v_df_bytes := 0;  -- will retry dba_data_files below
     END;
+
+    -- ------------------------------------------------------------------
+    -- Retry dba_data_files independently if the DBA segments path failed
+    -- (e.g. dba_segments not granted but dba_data_files is).
+    -- ------------------------------------------------------------------
+    IF v_df_bytes = 0 AND v_tablespace IS NOT NULL THEN
+        BEGIN
+            EXECUTE IMMEDIATE
+                'SELECT NVL(SUM(bytes), 0) FROM dba_data_files WHERE tablespace_name = :ts'
+                INTO v_df_bytes USING v_tablespace;
+        EXCEPTION WHEN OTHERS THEN v_df_bytes := 0; END;
+    END IF;
 
     -- ------------------------------------------------------------------
     -- Single pipe-delimited line. Wrapper greps for ^EPF_SIZES| prefix.

@@ -278,6 +278,22 @@ interactive_prompts() {
         echo ""
     fi
 
+    if [[ -z "$SYS_PASSWORD" ]]; then
+        echo ""
+        echo "  SYS/DBA Password (optional)"
+        echo "  Enables accurate tablespace sizing and is required later for"
+        echo "  optimize-db and space reclaim. Press Enter to skip."
+        read -rsp "  SYS password: " SYS_PASSWORD
+        echo ""
+    fi
+
+    # Apply DBA grants early so capture_module_sizes can query dba_data_files.
+    if [[ -n "$SYS_PASSWORD" ]]; then
+        echo ""
+        echo "  [INFO]  Granting DBA view access to ${USERNAME}..."
+        grant_dba_views
+    fi
+
     echo ""
     echo "  Retention Period"
     echo "  Data older than this many days will be purged."
@@ -285,7 +301,7 @@ interactive_prompts() {
     read -rp "  Retention days [$RETENTION_DAYS]: " input
     RETENTION_DAYS="${input:-$RETENTION_DAYS}"
 
-    # Auto-capture module sizes for the depth prompt + max-iter recommendation.
+    # Capture module sizes for the depth prompt + max-iter recommendation.
     # Silent on failure; falls back to depth prompt without size hints.
     echo ""
     echo "  [INFO]  Querying current data sizes..."
@@ -382,11 +398,11 @@ interactive_prompts() {
         SKIP_STALL_CHECKS="${input:-$SKIP_STALL_CHECKS}"
     fi
 
-    # Prompt for SYS password now if optimize-db or reclaim enabled
+    # Prompt for SYS password if optimize-db or reclaim enabled but not yet provided
     if [[ "${OPTIMIZE_DB^^}" == "Y" || "${RECLAIM_SPACE^^}" == "Y" ]]; then
         if [[ -z "$SYS_PASSWORD" ]]; then
             echo ""
-            echo "  SYS/DBA password (needed for optimize-db and/or reclaim)"
+            echo "  SYS/DBA password (required for optimize-db / reclaim)"
             read -rsp "  SYS password: " SYS_PASSWORD
             echo ""
         fi
@@ -547,6 +563,7 @@ grant_dba_views() {
 SET HEADING OFF FEEDBACK OFF
 GRANT SELECT ON sys.dba_segments TO ${USERNAME};
 GRANT SELECT ON sys.dba_lobs TO ${USERNAME};
+GRANT SELECT ON sys.dba_data_files TO ${USERNAME};
 EXIT;
 SQLEOF
     log_ok "DBA view grants applied"
