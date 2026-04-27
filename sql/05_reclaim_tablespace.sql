@@ -158,6 +158,14 @@ DECLARE
     -- run_id of the current purge run (for log entries)
     v_run_id           RAW(16) := NULL;
 
+    -- Pause flag for reclaim_log(). Set TRUE while we relocate the log
+    -- tables themselves (Phase 1c) so autonomous-transaction inserts don't
+    -- race with the MOVE/REBUILD operations on the very table they target.
+    -- The flag is in the outer block's scope and visible to the autonomous
+    -- procedure (PRAGMA AUTONOMOUS_TRANSACTION controls TX boundaries, not
+    -- variable scope).
+    v_log_paused       BOOLEAN := FALSE;
+
     -- Squeeze-progress cadence: log every N iterations. NO wallclock floor.
     -- A floor turns into "every iter" when individual MOVE/REBUILD ops are
     -- slow (LOB segments under high retention can take 90-300s each), which
@@ -218,7 +226,7 @@ DECLARE
     IS
         PRAGMA AUTONOMOUS_TRANSACTION;
     BEGIN
-        IF v_run_id IS NULL THEN
+        IF v_run_id IS NULL OR v_log_paused THEN
             COMMIT;
             RETURN;
         END IF;
@@ -440,19 +448,170 @@ BEGIN
     END IF;
 
     -- ========================================================================
+    -- Step 1c: Relocate purge log/snapshot tables OUT of OPPAYMENTS
+    -- ========================================================================
+    -- The purge log/snapshot tables (EPF_PURGE_LOG, EPF_PURGE_SPACE_SNAPSHOT)
+    -- and their indexes physically sit at the top of the OPPAYMENTS
+    -- tablespace. Just *excluding* them from the squeeze isn't enough: their
+    -- block_id positions still anchor HWM near the wall. Even after every
+    -- other top segment is squeezed lower, HWM cannot drop below the log
+    -- tables. The user's data:
+    --
+    --     IDX_EPF_SPACE_SNAP_RUN     ends @ 40.0068 GB  <-- HWM, excluded
+    --     EPF_PURGE_LOG              ends @ 40.0029 GB  <-- excluded
+    --     IDX_EPF_PURGE_LOG_MODULE   ends @ 40.0028 GB  <-- excluded
+    --     IDX_EPF_PURGE_LOG_TS       ends @ 40.0027 GB  <-- excluded
+    --
+    -- And every DROP+CREATE on the highest non-excluded index landed back at
+    -- 40.0032 GB because Oracle's allocator picks the freshly-freed slot
+    -- (locality bias) -- and that slot was *below* the log-table wall, so
+    -- the new copy fit there.
+    --
+    -- Fix: move the log/snapshot tables to a different tablespace entirely.
+    -- They have no dependency on living in OPPAYMENTS; only convention put
+    -- them there. After the move, OPPAYMENTS HWM can drop to actual data.
+    --
+    -- Target preference: USERS (always exists on most installs, designed
+    -- exactly for ancillary user data). Falls back to SYSAUX if USERS is
+    -- missing or offline. If neither is available, logs a warning and
+    -- skips the move (reclaim continues but bottoms out at the log-table
+    -- position, same as before this fix).
+    --
+    -- v_log_paused gates reclaim_log() during the moves so autonomous
+    -- inserts don't race with the MOVE ONLINE / REBUILD ONLINE statements.
+    DECLARE
+        v_target_ts        VARCHAR2(128) := NULL;
+        v_ts_count         NUMBER := 0;
+        v_relocated        NUMBER := 0;
+        v_relocate_errors  NUMBER := 0;
+    BEGIN
+        -- Pick target tablespace
+        SELECT COUNT(*) INTO v_ts_count
+        FROM dba_tablespaces
+        WHERE tablespace_name = 'USERS' AND status = 'ONLINE'
+          AND contents = 'PERMANENT';
+        IF v_ts_count > 0 THEN
+            v_target_ts := 'USERS';
+        ELSE
+            SELECT COUNT(*) INTO v_ts_count
+            FROM dba_tablespaces
+            WHERE tablespace_name = 'SYSAUX' AND status = 'ONLINE';
+            IF v_ts_count > 0 THEN
+                v_target_ts := 'SYSAUX';
+            END IF;
+        END IF;
+
+        IF v_target_ts IS NULL THEN
+            reclaim_log('LOG_RELOCATE', 'WARNING',
+                'No USERS or SYSAUX tablespace available for log-table'
+                || ' relocation. Skipping; reclaim will bottom out at the'
+                || ' current log-table block_id position.',
+                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+            DBMS_OUTPUT.PUT_LINE('  Log-table relocation: SKIPPED (no target tablespace)');
+        ELSE
+            DBMS_OUTPUT.PUT_LINE('');
+            DBMS_OUTPUT.PUT_LINE('=== Phase 1c: Relocate log/snapshot tables to ' || v_target_ts || ' ===');
+
+            -- Pause autonomous logging so we don't race with the moves
+            v_log_paused := TRUE;
+
+            -- 1. Move the tables themselves (only those still in OPPAYMENTS).
+            --    MOVE ONLINE keeps them queryable and keeps indexes valid
+            --    (Oracle 12.2+).
+            FOR tbl IN (
+                SELECT table_name
+                  FROM dba_tables
+                 WHERE owner = 'OPPAYMENTS'
+                   AND table_name IN ('EPF_PURGE_LOG', 'EPF_PURGE_SPACE_SNAPSHOT')
+                   AND tablespace_name = v_tablespace
+            ) LOOP
+                BEGIN
+                    EXECUTE IMMEDIATE
+                        'ALTER TABLE OPPAYMENTS.' || tbl.table_name
+                        || ' MOVE ONLINE TABLESPACE ' || v_target_ts;
+                    v_relocated := v_relocated + 1;
+                    DBMS_OUTPUT.PUT_LINE('  Moved table: OPPAYMENTS.' || tbl.table_name
+                        || ' -> ' || v_target_ts);
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        v_relocate_errors := v_relocate_errors + 1;
+                        DBMS_OUTPUT.PUT_LINE('  Move FAILED for ' || tbl.table_name
+                            || ': ' || SUBSTR(SQLERRM, 1, 200));
+                END;
+            END LOOP;
+
+            -- 2. Rebuild indexes in the new tablespace. Filter on
+            --    table_owner+table_name (not index name) to catch
+            --    constraint-backed indexes with auto-generated SYS_C* names.
+            FOR idx IN (
+                SELECT i.owner, i.index_name
+                  FROM dba_indexes i
+                 WHERE i.table_owner = 'OPPAYMENTS'
+                   AND i.table_name IN ('EPF_PURGE_LOG', 'EPF_PURGE_SPACE_SNAPSHOT')
+                   AND i.tablespace_name = v_tablespace
+            ) LOOP
+                BEGIN
+                    EXECUTE IMMEDIATE
+                        'ALTER INDEX ' || idx.owner || '.' || idx.index_name
+                        || ' REBUILD ONLINE TABLESPACE ' || v_target_ts;
+                    v_relocated := v_relocated + 1;
+                    DBMS_OUTPUT.PUT_LINE('  Rebuilt index: ' || idx.owner || '.' || idx.index_name
+                        || ' -> ' || v_target_ts);
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        v_relocate_errors := v_relocate_errors + 1;
+                        DBMS_OUTPUT.PUT_LINE('  Index rebuild FAILED for ' || idx.index_name
+                            || ': ' || SUBSTR(SQLERRM, 1, 200));
+                END;
+            END LOOP;
+
+            -- Resume logging (safe even if some moves failed; the tables
+            -- still exist, just possibly in a mix of tablespaces)
+            v_log_paused := FALSE;
+
+            IF v_relocated > 0 THEN
+                reclaim_log('LOG_RELOCATE', 'SUCCESS',
+                    'Relocated ' || v_relocated || ' log/snapshot segments to '
+                    || v_target_ts || ' tablespace (errors=' || v_relocate_errors
+                    || '). OPPAYMENTS HWM can now drop below their previous'
+                    || ' positions.',
+                    ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+            ELSE
+                reclaim_log('LOG_RELOCATE', 'INFO',
+                    'No log/snapshot segments needed relocation (already in '
+                    || v_target_ts || ' or another non-OPPAYMENTS tablespace).',
+                    ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+            END IF;
+
+            -- Recompute HWM after the relocation -- it may have dropped
+            -- significantly. The squeeze loop below picks up the new value.
+            v_hwm_gb := get_hwm_gb;
+            v_used_gb := get_used_gb;
+            v_target_hwm_gb := v_used_gb * (1 + c_target_pct_free / 100);
+            DBMS_OUTPUT.PUT_LINE('  Post-relocate HWM: ' || ROUND(v_hwm_gb, 4) || ' GB');
+        END IF;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Always re-enable logging, even on failure
+            v_log_paused := FALSE;
+            DBMS_OUTPUT.PUT_LINE('  Log-table relocation FAILED: ' || SUBSTR(SQLERRM, 1, 200));
+            reclaim_log('LOG_RELOCATE', 'WARNING',
+                'Log-table relocation failed: ' || SUBSTR(SQLERRM, 1, 200)
+                || '. Continuing without it; reclaim may not reach lowest HWM.',
+                ROUND((CAST(SYSTIMESTAMP AS DATE) - CAST(v_started AS DATE)) * 86400));
+    END;
+
+    -- ========================================================================
     -- Step 2: Iterative squeeze loop (defragment HWM)
     -- ========================================================================
     -- Pre-populate v_skip_segments with the reclaim's own log/snapshot tables
-    -- and every dependent segment they own (indexes + LOBs). MOVE/REBUILD on
-    -- these creates a feedback loop because reclaim_log() inserts a row every
-    -- iteration -- the segment re-extends near the HWM immediately after
-    -- being moved, then becomes top again on the next iteration. With the
-    -- log table, its 3 indexes, the snapshot table and its index cycling as
-    -- "top", no single segment is consecutively top long enough to hit the
-    -- per-segment retry threshold, so the squeeze ran forever for zero net
-    -- HWM movement. Excluding them up front lets the squeeze focus on real
-    -- top segments. The SHRINK phase already excludes these tables for the
-    -- same reason (see the SELECT in the FOR tbl IN ... LOOP earlier).
+    -- and every dependent segment they own (indexes + LOBs). Belt-and-braces
+    -- with Phase 1c above: if a previous run failed mid-relocate, or if the
+    -- target tablespace was missing, some log segments might still be in
+    -- OPPAYMENTS. Excluding them by name protects the squeeze from a
+    -- feedback loop with reclaim_log() inserts. After Phase 1c succeeds,
+    -- this exclusion is a no-op for those segments (they're not in
+    -- OPPAYMENTS anymore).
     DECLARE
         v_excluded_count NUMBER := 0;
     BEGIN
@@ -806,6 +965,48 @@ BEGIN
                     v_idx_ddl := RTRIM(v_idx_ddl, CHR(10) || CHR(13) || CHR(9) || ' ');
 
                     EXECUTE IMMEDIATE 'DROP INDEX ' || v_seg_owner || '.' || v_seg_name;
+
+                    -- Tighten the datafile ceiling between DROP and CREATE.
+                    -- Without this, the freshly-freed slot at the dropped
+                    -- index's old position is the highest free hole below
+                    -- the existing 50 MB ceiling -- Oracle's allocator picks
+                    -- it for locality, and the new index lands at the same
+                    -- height as the old one (defeating the whole point of
+                    -- DROP+CREATE). Resizing the datafile to (post-drop HWM
+                    -- + 1 MB) physically truncates the freshly-freed slot
+                    -- out of the datafile entirely, forcing CREATE to pick
+                    -- a hole strictly below the post-drop HWM.
+                    DECLARE
+                        v_post_drop_hwm NUMBER;
+                        v_tight_ceiling NUMBER;
+                    BEGIN
+                        v_post_drop_hwm := get_hwm_gb;
+                        v_tight_ceiling := CEIL(v_post_drop_hwm * 1024 + 1) * 1024 * 1024;
+                        IF v_tight_ceiling < v_df_bytes THEN
+                            BEGIN
+                                EXECUTE IMMEDIATE
+                                    'ALTER DATABASE DATAFILE ''' || v_datafile
+                                    || ''' RESIZE ' || v_tight_ceiling;
+                                v_df_bytes := v_tight_ceiling;
+                                DBMS_OUTPUT.PUT_LINE('       Tight ceiling: '
+                                    || ROUND(v_tight_ceiling/1024/1024/1024, 4)
+                                    || ' GB (post-drop HWM '
+                                    || ROUND(v_post_drop_hwm, 4) || ' GB + 1 MB)');
+                            EXCEPTION
+                                WHEN OTHERS THEN
+                                    -- ORA-03297: another segment in the way.
+                                    -- Proceed with CREATE at current ceiling
+                                    -- (will probably land high again but at
+                                    -- least we don't crash the fallback).
+                                    IF SQLCODE = -3297 THEN
+                                        DBMS_OUTPUT.PUT_LINE('       Tight ceiling skipped (data at boundary)');
+                                    ELSE
+                                        RAISE;
+                                    END IF;
+                            END;
+                        END IF;
+                    END;
+
                     EXECUTE IMMEDIATE v_idx_ddl;
 
                     v_idx_ddl_ok      := TRUE;
