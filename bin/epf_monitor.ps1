@@ -1,0 +1,390 @@
+# ============================================================================
+# EPF Data Purge - Live Progress Monitor (PowerShell)
+# ============================================================================
+# Runs alongside the purge in a separate process.  Polls epf_purge_log via
+# SQL*Plus every N seconds and prints new entries to stdout in real-time.
+# Output is NOT buffered (each poll is a separate SQL*Plus invocation).
+#
+# Automatically exits when it sees RECLAIM_END, a top-level ERROR,
+# or when the wrapper script kills it after the run completes.
+#
+# Usage:
+#   powershell -File epf_monitor.ps1 -ConnStr "user/pass@tns" -PollSec 10
+# ============================================================================
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$ConnStr,         # SQL*Plus connection string: user/pass@tns
+
+    [int]$PollSec = 10,       # Poll interval in seconds
+    [int]$MaxWaitMin = 360,   # Max idle wait in minutes before timeout
+
+    [string]$LogFile = ""     # Optional: also append to this file
+)
+
+$ErrorActionPreference = "SilentlyContinue"
+
+# Open log file with FileShare.ReadWrite so the main process (which also holds
+# the file open with ReadWrite sharing) does not cause a sharing violation.
+# The previous Out-File approach used FileShare.Read internally, which silently
+# failed when the main purge process already held a write handle.
+$logStream = $null
+$logWriter = $null
+if ($LogFile -ne "") {
+    try {
+        $logStream = [IO.FileStream]::new($LogFile, 'Append', 'Write', 'ReadWrite')
+        $logWriter = [IO.StreamWriter]::new($logStream, [Text.Encoding]::UTF8)
+        $logWriter.AutoFlush = $true
+    } catch {
+        Write-Host "[MONITOR] WARNING: Could not open log file for writing: $_"
+        $logWriter = $null
+        $logStream = $null
+    }
+}
+
+
+# Write-Host is the standard PowerShell way to print to the host (console)
+# and works reliably when the monitor runs in its own console window. The
+# previous raw-StreamWriter / Console.Out.Flush experiments were only needed
+# when the monitor shared a parent cmd's console via Start-Process
+# -NoNewWindow (which had handle-inheritance buffering bugs). With the new
+# layout (separate console window on Windows, suppressed stdout on Linux),
+# those workarounds aren't needed.
+function Write-Log($msg) {
+    Write-Host $msg
+    if ($script:logWriter) {
+        try { $script:logWriter.WriteLine($msg) } catch { }
+    }
+}
+
+# Helper: run sqlplus with a process-level timeout to prevent hangs.
+# The old pipe pattern ($sql | sqlplus ... 2>$null) had no timeout, so if
+# sqlplus hung (e.g. stuck on Oracle ADR / sqlnet.log file locks when another
+# sqlplus instance holds the file), the entire monitor froze until Ctrl+C.
+# Using Start-Process with file-based I/O (@file) and WaitForExit($timeout)
+# lets us kill a hung sqlplus automatically and retry on the next poll cycle.
+# An earlier Process.Start attempt used short timeouts that triggered false
+# positives; the 90 s default here is generous enough for normal SELECT polls
+# while still recovering from genuine hangs within ~1.5 poll intervals.
+function Invoke-SqlPoll {
+    param([string]$Sql, [int]$TimeoutMs = 90000)
+    $base    = Join-Path $env:TEMP "epfmon_${PID}_$(Get-Random)"
+    $sqlFile = "$base.sql"
+    $outFile = "$base.out"
+    $errFile = "$base.err"
+    try {
+        [IO.File]::WriteAllText($sqlFile, $Sql)
+        $proc = Start-Process sqlplus `
+            -ArgumentList @("-L", "-S", $script:ConnStr, "@$sqlFile") `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile `
+            -RedirectStandardError  $errFile `
+            -ErrorAction Stop
+        if (-not $proc.WaitForExit($TimeoutMs)) {
+            try { $proc.Kill(); $proc.WaitForExit(5000) } catch {}
+            Write-Log "[MONITOR] WARNING: sqlplus timed out ($([Math]::Floor($TimeoutMs/1000))s), will retry next cycle"
+            return @()
+        }
+        return @(Get-Content $outFile -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Trim() -ne "" })
+    } catch {
+        return @()
+    } finally {
+        Remove-Item $sqlFile, $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Log "============================================================"
+Write-Log "  EPF PURGE - LIVE MONITOR"
+Write-Log "  Poll interval: ${PollSec}s   Max wait: ${MaxWaitMin} min"
+Write-Log "  Started:       $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Write-Log "============================================================"
+Write-Log ""
+
+$lastLogId = 0
+$runId = ""
+$foundRun = $false
+$done = $false
+$idleSince = Get-Date
+$waitMsgCount = 0
+
+# Query the Oracle server's own time so comparisons against log_timestamp
+# (which uses SYSTIMESTAMP) are in the same timezone.  Falls back to client
+# UTC if the query fails (e.g. connectivity not yet established).
+$serverTimeSql = @"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 100 TRIMOUT ON TRIMSPOOL ON
+SELECT TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS') FROM dual;
+EXIT;
+"@
+$serverTimeResult = Invoke-SqlPoll $serverTimeSql
+$monitorStartTime = ""
+if ($serverTimeResult) {
+    $parsed = ($serverTimeResult | Select-Object -First 1).Trim()
+    if ($parsed -match '^\d{4}-\d{2}-\d{2}') {
+        $monitorStartTime = $parsed
+    }
+}
+if (-not $monitorStartTime) {
+    $monitorStartTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+    Write-Log "[MONITOR] WARNING: Could not query server time; using client UTC."
+}
+Write-Log "[MONITOR] Server baseline: $monitorStartTime"
+Write-Log ""
+
+while (-not $done) {
+    # Build a SQL query that fetches new log entries
+    if (-not $foundRun) {
+        # Find the latest run_id that is either:
+        #   (a) still in progress (no RECLAIM_END and no top-level ERROR), OR
+        #   (b) started after this monitor was launched
+        # This prevents the monitor from picking up a completed old run,
+        # replaying its RECLAIM_END / ERROR termination event, and exiting
+        # before the new run even starts.
+        $sql = @"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300 TRIMOUT ON TRIMSPOOL ON
+SELECT RAWTOHEX(run_id) FROM (
+    SELECT run_id FROM oppayments.epf_purge_log
+    WHERE operation IN ('RUN_START', 'RECLAIM_START')
+      AND (
+          -- Run started after the monitor launched (definitely current)
+          log_timestamp >= TO_TIMESTAMP('$monitorStartTime', 'YYYY-MM-DD HH24:MI:SS')
+          OR
+          -- Run has not completed yet (still in progress)
+          NOT EXISTS (
+              SELECT 1 FROM oppayments.epf_purge_log e2
+              WHERE e2.run_id = oppayments.epf_purge_log.run_id
+                AND (e2.operation = 'RECLAIM_END'
+                     OR (e2.module = 'ORCHESTRATOR' AND e2.status = 'ERROR'))
+          )
+      )
+    ORDER BY log_timestamp DESC
+) WHERE ROWNUM = 1;
+EXIT;
+"@
+        $result = Invoke-SqlPoll $sql
+        if ($result) {
+            $runId = ($result | Select-Object -First 1).Trim()
+            if ($runId -and $runId.Length -ge 16) {
+                $foundRun = $true
+                $idleSince = Get-Date
+                Write-Log "[MONITOR] Tracking run_id: $runId"
+
+                # Skip log entries that already existed before this monitor
+                # launched. This prevents replaying old DELETE / RECLAIM rows
+                # when the reclaim attaches to an existing purge run_id.
+                $skipSql = @"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 100 TRIMOUT ON TRIMSPOOL ON
+SELECT NVL(MAX(log_id), 0) FROM oppayments.epf_purge_log
+WHERE run_id = HEXTORAW('$runId')
+  AND log_timestamp < TO_TIMESTAMP('$monitorStartTime', 'YYYY-MM-DD HH24:MI:SS');
+EXIT;
+"@
+                $skipResult = Invoke-SqlPoll $skipSql
+                if ($skipResult) {
+                    $parsed = ($skipResult | Select-Object -First 1).Trim()
+                    if ($parsed -match '^\d+$') {
+                        $lastLogId = [long]$parsed
+                        if ($lastLogId -gt 0) {
+                            Write-Log "[MONITOR] Skipping $lastLogId pre-existing log entries."
+                        }
+                    }
+                }
+
+                Write-Log ""
+            }
+        }
+        if (-not $foundRun) {
+            $waitMsgCount++
+            if ($waitMsgCount % 6 -eq 1) {
+                Write-Log "[MONITOR] Waiting for purge to start..."
+            }
+        }
+    }
+
+    if ($foundRun) {
+        # Fetch new log entries since last_log_id
+        $sql = @"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 500 TRIMOUT ON TRIMSPOOL ON
+SELECT log_id || '|' ||
+       TO_CHAR(log_timestamp, 'HH24:MI:SS') || '|' ||
+       module || '|' ||
+       operation || '|' ||
+       NVL(TO_CHAR(batch_number), '') || '|' ||
+       NVL(TO_CHAR(rows_affected), '0') || '|' ||
+       status || '|' ||
+       NVL(REPLACE(message, '|', '/'), '') || '|' ||
+       NVL(TO_CHAR(ROUND(elapsed_seconds, 1)), '') || '|' ||
+       NVL(table_name, '') || '|' ||
+       NVL(REPLACE(error_message, '|', '/'), '')
+FROM oppayments.epf_purge_log
+WHERE run_id = HEXTORAW('$runId')
+  AND log_id > $lastLogId
+ORDER BY log_id;
+EXIT;
+"@
+        $rows = Invoke-SqlPoll $sql
+
+        $anyNew = $false
+        foreach ($row in $rows) {
+            $parts = $row.Trim().Split('|')
+            if ($parts.Count -lt 8) { continue }
+
+            $logId      = [int]$parts[0].Trim()
+            $ts         = $parts[1].Trim()
+            $module     = $parts[2].Trim()
+            $operation  = $parts[3].Trim()
+            $batchNum   = $parts[4].Trim()
+            $rowsAff    = $parts[5].Trim()
+            $status     = $parts[6].Trim()
+            $message    = $parts[7].Trim()
+            $elapsed    = if ($parts.Count -gt 8) { $parts[8].Trim() } else { "" }
+            $tableName  = if ($parts.Count -gt 9) { $parts[9].Trim() } else { "" }
+            $errorMsg   = if ($parts.Count -gt 10) { $parts[10].Trim() } else { "" }
+
+            $anyNew = $true
+            if ($logId -gt $lastLogId) { $lastLogId = $logId }
+            $idleSince = Get-Date
+
+            # Format output based on entry type
+            if ($operation -eq "RUN_START") {
+                Write-Log "[$ts] ** PURGE STARTED ** $message"
+            }
+            elseif ($operation -eq "RUN_END") {
+                if ($status -eq "ERROR") {
+                    Write-Log "[$ts] *** PURGE FAILED *** $message"
+                    $done = $true
+                }
+                else {
+                    Write-Log "[$ts] ** PURGE COMPLETED ** $message (total: ${elapsed}s)"
+                    Write-Log "[$ts] Waiting for shrink/reclaim..."
+                    # Don't exit -- shrink and/or reclaim may follow. Monitor
+                    # continues until RECLAIM_END, idle timeout, or the wrapper
+                    # script kills it.
+                }
+            }
+            elseif ($operation -eq "RECLAIM_START") {
+                Write-Log ""
+                Write-Log "[$ts] ** RECLAIM STARTED ** $message"
+            }
+            elseif ($operation -eq "RECLAIM_END") {
+                if ($status -eq "ERROR") {
+                    Write-Log "[$ts] *** RECLAIM FAILED *** $message"
+                }
+                else {
+                    Write-Log "[$ts] ** RECLAIM COMPLETED ** $message (total: ${elapsed}s)"
+                }
+                $done = $true
+            }
+            elseif ($operation -eq "PHASE_START") {
+                Write-Log ""
+                Write-Log "[$ts] >>> PHASE: $message"
+            }
+            elseif ($operation -eq "PHASE_END") {
+                Write-Log "[$ts] <<< PHASE done: $message"
+            }
+            elseif ($operation -eq "SHRINK_DONE") {
+                Write-Log "[$ts] RECLAIM      $message (${elapsed}s)"
+            }
+            elseif ($operation -eq "SHRINK_PROGRESS" -or $operation -eq "SQUEEZE_PROGRESS" `
+                -or $operation -eq "CAPTURE_DDL" -or $operation -eq "LOG_RELOCATE" `
+                -or $operation -eq "DROP_FK" -or $operation -eq "DROP_PK" -or $operation -eq "DROP_IDX" `
+                -or $operation -eq "RESIZE_DF" `
+                -or $operation -eq "RECREATE_IDX" -or $operation -eq "RECREATE_PK" -or $operation -eq "RECREATE_FK" `
+                -or $operation -eq "DDL_BACKUP" -or $operation -eq "GUARD" `
+                -or $operation -eq "SCRATCH_TS" -or $operation -eq "INTERMEDIATE" `
+                -or $operation -eq "DRAIN_START" -or $operation -eq "DRAIN_PROGRESS" -or $operation -eq "DRAIN_DONE" `
+                -or $operation -eq "REFILL_START" -or $operation -eq "REFILL_PROGRESS" -or $operation -eq "REFILL_DONE") {
+                Write-Log "[$ts] RECLAIM      $message (${elapsed}s)"
+            }
+            elseif ($operation -eq "DELETE" -and $batchNum -ne "") {
+                # Batch progress
+                $mod = $module.PadRight(12)
+                Write-Log "[$ts] $mod batch $($batchNum.PadLeft(5))  $message  (${elapsed}s)"
+            }
+            elseif ($operation -eq "DELETE" -and $tableName -ne "" -and $batchNum -eq "" -and [int]$rowsAff -gt 0) {
+                # Per-table total
+                $mod = $module.PadRight(12)
+                $tbl = $tableName.PadRight(48)
+                $ra  = $rowsAff.PadLeft(14)
+                Write-Log "[$ts] $mod TOTAL  $tbl $ra"
+            }
+            elseif ($status -eq "ERROR") {
+                # Show error_message (SQLERRM) when message is empty
+                $displayMsg = if ($message -ne "") { $message } elseif ($errorMsg -ne "") { $errorMsg } else { "(no details)" }
+                Write-Log "[$ts] *** ERROR *** $module - $displayMsg"
+                # Only ORCHESTRATOR errors are fatal; module-level errors
+                # are non-fatal -- the orchestrator continues to the next module.
+                if ($module -eq "ORCHESTRATOR") {
+                    $done = $true
+                }
+            }
+            elseif ($operation -match "DRY_RUN_COUNT|INFO|INIT") {
+                $mod = $module.PadRight(12)
+                Write-Log "[$ts] $mod $message"
+            }
+            else {
+                if ($message -ne "") {
+                    $mod = ($module + " ").Substring(0, [Math]::Min(12, $module.Length + 1)).PadRight(12)
+                    Write-Log "[$ts] $mod $message"
+                }
+            }
+        }
+
+        # If no new rows, check for newer run_id (handles cancelled/restarted runs)
+        if (-not $anyNew -and $lastLogId -gt 0) {
+            $sqlRecheck = @"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300 TRIMOUT ON TRIMSPOOL ON
+SELECT RAWTOHEX(run_id) FROM (
+    SELECT run_id FROM oppayments.epf_purge_log
+    WHERE operation IN ('RUN_START', 'RECLAIM_START')
+    ORDER BY log_timestamp DESC
+) WHERE ROWNUM = 1;
+EXIT;
+"@
+            $latestId = (Invoke-SqlPoll $sqlRecheck | Select-Object -First 1)
+            if ($latestId) { $latestId = $latestId.Trim() }
+            if ($latestId -and $latestId.Length -ge 16 -and $latestId -ne $runId) {
+                Write-Log ""
+                Write-Log "[MONITOR] Newer run detected: $latestId (was $runId)"
+                Write-Log "[MONITOR] Switching to new run_id..."
+                Write-Log ""
+                $runId = $latestId
+                $lastLogId = 0
+                $idleSince = Get-Date
+            }
+            else {
+                # Same run — check for missed completion
+                $sqlCheck = @"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 50 TRIMOUT ON TRIMSPOOL ON
+SELECT COUNT(*) FROM oppayments.epf_purge_log
+WHERE run_id = HEXTORAW('$runId')
+  AND (operation = 'RECLAIM_END' OR (module = 'ORCHESTRATOR' AND status = 'ERROR'));
+EXIT;
+"@
+                $endCount = (Invoke-SqlPoll $sqlCheck | Select-Object -First 1)
+                if ($endCount) { $endCount = $endCount.Trim() }
+                if ($endCount -and [int]$endCount -gt 0) {
+                    $done = $true
+                }
+            }
+        }
+    }
+
+    if ($done) { break }
+
+    # Check timeout
+    $idleSeconds = ((Get-Date) - $idleSince).TotalSeconds
+    if ($idleSeconds -gt ($MaxWaitMin * 60)) {
+        Write-Log "[MONITOR] Timeout: no activity for $([Math]::Round($idleSeconds / 60)) minutes. Exiting."
+        break
+    }
+
+    Start-Sleep -Seconds $PollSec
+}
+
+Write-Log ""
+Write-Log "[MONITOR] Monitor stopped at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Write-Log "============================================================"
+
+# Clean up log file handles
+if ($logWriter) { try { $logWriter.Close() } catch { } }
+if ($logStream) { try { $logStream.Close() } catch { } }

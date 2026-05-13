@@ -1,0 +1,64 @@
+# ============================================================================
+# EPF Data Purge - Configuration File
+# ============================================================================
+# Copy this file to epf_purge.conf and edit the values below.
+# Used for automated/scheduled runs (non-interactive mode).
+#
+# CLI arguments always take precedence over config file values.
+# Environment variables EPF_PURGE_PASSWORD / EPF_SYS_PASSWORD override
+# PASSWORD / SYS_PASSWORD from both config and CLI.
+#
+# Usage:
+#   Linux:   ./bin/epf_purge.sh --config config/epf_purge.conf
+#   Windows: bin\epf_purge.bat --config config\epf_purge.conf
+# ============================================================================
+
+# ---------- Oracle Connection ------------------------------------------------
+# TNS alias (required)
+TNS_NAME=CHANGE_ME
+
+# Schema user (default: oppayments)
+# USERNAME=oppayments
+
+# Schema password (prefer EPF_PURGE_PASSWORD env var for security)
+# PASSWORD=
+
+# SYS password — required for --reclaim and --optimize-db
+# (prefer EPF_SYS_PASSWORD env var for security)
+# SYS_PASSWORD=
+
+# ---------- Purge Parameters -------------------------------------------------
+# Data retention in days (rows older than this are deleted)
+RETENTION_DAYS=30
+
+# Purge scope: ALL | PAYMENTS | LOGS | BANK_STATEMENTS (comma-separated)
+PURGE_DEPTH=ALL
+
+# Purge mode: FULL (delete entire rows) | CLOB_ONLY (truncate CLOBs, keep rows)
+#              CLOB_N_LOGS (truncate CLOBs + delete log/archive rows)
+# PURGE_MODE=FULL
+
+# Rows per commit batch
+# BATCH_SIZE=1000
+
+# ---------- Execution Flags --------------------------------------------------
+# Dry run: Y = preview only (no deletes), N = live execution
+# DRY_RUN=N
+
+# Reclaim tablespace after purge (drop indexes, drain, refill, recreate)
+# RECLAIM_SPACE=N
+
+# Optimize DB before purge (enlarge redo logs, gather stats, create FK indexes)
+# OPTIMIZE_DB=N
+
+# Skip all confirmation prompts (equivalent to -y / --assume-yes)
+# ASSUME_YES=N
+
+# Drop the PL/SQL package after purge completes
+# DROP_PACKAGE_AFTER=N
+
+# Drop purge log tables after run (epf_purge_log, epf_purge_space_snapshot)
+# DROP_LOGS=N
+
+# Truncate purge log tables before run (clear old run history)
+# TRUNCATE_LOGS=N
